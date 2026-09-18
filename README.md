@@ -58,4 +58,19 @@ ai에게 코딩을 시키자, 제대로!
 #### CLI codex
 
 - 파워셀, 콘솔 창에서 명령어로 수행하는 codex
+
+## 주식 자동매매 개발환경
+
+### 토스증권 openapi
+
+- https://corp.tossinvest.com/ko/open-api
+- 토스앱 모바일 설치 가입
+- 토스증권 사용 설정
+- 토스증권 pc 웹사이트
+- 사용중인 아이피를 토스증권 ,pc 등록
+- cmd 에서 ipconfig 하면 나의 ip 주소를 알수 있음
+- open api - ip추가해서 내 ip 추가해야됨
+- openapi 키 발급 후 client id, client secret 문자열 보관
+-
+
 -
