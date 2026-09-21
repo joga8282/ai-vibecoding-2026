@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Paper trader local state and secrets
+.env
+data/
+tmp*/
+tests/.paper-trader-*.db
+
 # C extensions
 *.so
 
