@@ -19,6 +19,7 @@ class PaperBroker:
             Currency.KRW: settings.initial_cash_krw,
             Currency.USD: settings.initial_cash_usd,
         }
+        self.initial_cash: dict[Currency, Decimal] = dict(self.cash)
         self.positions: dict[str, Position] = {}
         self.orders: list[Order] = []
         self.realized_profit_loss: dict[Currency, Decimal] = {
@@ -34,6 +35,10 @@ class PaperBroker:
             return
         self.cash = {
             Currency(key): Decimal(value) for key, value in snapshot["cash"].items()
+        }
+        self.initial_cash = {
+            Currency(key): Decimal(value)
+            for key, value in snapshot.get("initial_cash", snapshot["cash"]).items()
         }
         self.realized_profit_loss = {
             Currency(key): Decimal(value)
@@ -77,6 +82,7 @@ class PaperBroker:
             raise ValueError("초기자금은 0 이상이어야 합니다.")
         async with self._lock:
             self.cash = {Currency.KRW: cash_krw, Currency.USD: cash_usd}
+            self.initial_cash = dict(self.cash)
             self.positions.clear()
             self.orders.clear()
             self.realized_profit_loss = {
@@ -194,11 +200,48 @@ class PaperBroker:
             "total_equity": serialize(equity),
         }
 
+    def performance(self, quotes: dict[str, Quote]) -> dict:
+        account = self.account(quotes)
+        total_equity = {
+            Currency(key): Decimal(value)
+            for key, value in account["total_equity"].items()
+        }
+        by_currency = {}
+        for currency in Currency:
+            initial = self.initial_cash[currency]
+            profit_loss = total_equity[currency] - initial
+            return_rate = (
+                profit_loss / initial * Decimal("100") if initial else Decimal("0")
+            )
+            by_currency[currency.value] = {
+                "initial_equity": str(initial),
+                "current_equity": str(total_equity[currency]),
+                "profit_loss": str(profit_loss),
+                "return_rate_percent": str(return_rate),
+                "realized_profit_loss": str(self.realized_profit_loss[currency]),
+                "unrealized_profit_loss": account["unrealized_profit_loss"][currency],
+            }
+        filled = [order for order in self.orders if order.status is OrderStatus.FILLED]
+        rejected = [order for order in self.orders if order.status is OrderStatus.REJECTED]
+        total_fees = {Currency.KRW: Decimal("0"), Currency.USD: Decimal("0")}
+        for order in filled:
+            total_fees[order.currency] += order.fee
+        return {
+            "by_currency": by_currency,
+            "orders": {
+                "total": len(self.orders),
+                "filled": len(filled),
+                "rejected": len(rejected),
+            },
+            "total_fees": serialize(total_fees),
+        }
+
     async def _persist(self) -> None:
         await self.repository.save(
             self.snapshot_name,
             {
                 "cash": serialize(self.cash),
+                "initial_cash": serialize(self.initial_cash),
                 "positions": serialize(list(self.positions.values())),
                 "orders": serialize(self.orders[-1000:]),
                 "realized_profit_loss": serialize(self.realized_profit_loss),

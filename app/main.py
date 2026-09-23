@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import random
 from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from app.config import Settings
@@ -14,7 +20,9 @@ from app.engine import TradingEngine
 from app.models import Currency, Quote, ThresholdStrategy, serialize, utc_now
 from app.paper import PaperBroker
 from app.repository import SnapshotRepository
+from app.recommendations import analyze_candidate
 from app.toss import TossMarketClient
+from app.weekly_report import WeeklyReportService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -63,7 +71,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         broker = PaperBroker(selected_settings, repository)
         await broker.restore()
         toss_client = None
-        if selected_settings.toss_client_id and selected_settings.toss_client_secret:
+        if (
+            selected_settings.toss_market_data_enabled
+            and selected_settings.toss_client_id
+            and selected_settings.toss_client_secret
+        ):
             toss_client = TossMarketClient(
                 selected_settings.toss_client_id, selected_settings.toss_client_secret
             )
@@ -73,6 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.repository = repository
         app.state.broker = broker
         app.state.engine = engine
+        app.state.weekly_report = WeeklyReportService()
         if selected_settings.auto_start:
             await engine.start()
         yield
@@ -87,6 +100,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard() -> FileResponse:
+        return FileResponse(static_dir / "index.html")
 
     @app.get("/health/live")
     async def health_live() -> dict:
@@ -104,6 +123,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/system/status")
     async def system_status(request: Request) -> dict:
         return get_engine(request).status()
+
+    @app.get("/api/v1/weekly-report")
+    async def weekly_report(
+        request: Request,
+        period: str = Query(default="daily", pattern=r"^(daily|weekly)$"),
+        refresh: bool = False,
+    ) -> dict:
+        return await request.app.state.weekly_report.report(period=period, force=refresh)
 
     @app.post("/api/v1/engine/start")
     async def start_engine(request: Request) -> dict:
@@ -150,6 +177,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = get_engine(request)
         return engine.broker.account(engine.quotes)
 
+    @app.get("/api/v1/performance")
+    async def performance(request: Request) -> dict:
+        engine = get_engine(request)
+        return engine.broker.performance(engine.quotes)
+
+    @app.get("/api/v1/risk/status")
+    async def risk_status(request: Request) -> dict:
+        engine = get_engine(request)
+        settings = request.app.state.settings
+        return {
+            "kill_switch": engine.kill_switch,
+            "max_order_amount": {
+                "KRW": str(settings.max_order_amount_krw),
+                "USD": str(settings.max_order_amount_usd),
+            },
+            "fee_rate": str(settings.fee_rate),
+            "slippage_bps": str(settings.slippage_bps),
+            "recommended_trade_ratio": str(settings.recommended_trade_ratio),
+        }
+
     @app.post("/api/v1/paper/reset")
     async def reset_paper_account(payload: PaperResetInput, request: Request) -> dict:
         engine = get_engine(request)
@@ -169,6 +216,195 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def list_quotes(request: Request) -> dict:
         return {"quotes": serialize(list(get_engine(request).quotes.values()))}
 
+    @app.get("/api/v1/market/lookup")
+    async def lookup_market(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9.\-]+$"),
+    ) -> dict:
+        engine = get_engine(request)
+        try:
+            quote = await engine.lookup_quote(symbol)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="조회된 시세가 없습니다.") from exc
+        except Exception as exc:
+            engine.last_error = f"market-lookup: {type(exc).__name__}: {exc}"
+            raise HTTPException(
+                status_code=502, detail="토스 시세 조회에 실패했습니다. 종목과 API 설정을 확인하세요."
+            ) from exc
+        stock = None
+        day_open = None
+        previous_close = None
+        if engine.toss_client:
+            try:
+                stock = await engine.toss_client.stock_info(quote.symbol)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Stock info lookup failed: %s", exc)
+            try:
+                daily_candles = await engine.candles(quote.symbol, "1d", 2)
+                if daily_candles:
+                    day_open = daily_candles[-1].open_price
+                if len(daily_candles) >= 2:
+                    previous_close = daily_candles[-2].close_price
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Daily open lookup failed: %s", exc)
+        return {
+            "quote": serialize(quote),
+            "day_open": str(day_open) if day_open is not None else None,
+            "previous_close": str(previous_close) if previous_close is not None else None,
+            "stock": {
+                "symbol": stock.get("symbol"),
+                "name": stock.get("name"),
+                "market": stock.get("market"),
+            } if stock else None,
+        }
+
+    @app.get("/api/v1/market/search")
+    async def search_market(
+        request: Request,
+        q: str = Query(min_length=1, max_length=50),
+        limit: int = Query(default=10, ge=1, le=20),
+    ) -> dict:
+        engine = get_engine(request)
+        if not engine.toss_client:
+            raise HTTPException(status_code=409, detail="한글 종목 검색은 토스 API 연결이 필요합니다.")
+        try:
+            stocks = await engine.toss_client.search_stocks(q, limit)
+        except Exception as exc:
+            engine.last_error = f"stock-search: {type(exc).__name__}: {exc}"
+            raise HTTPException(status_code=502, detail="종목명 검색에 실패했습니다.") from exc
+        return {
+            "query": q,
+            "results": [
+                {
+                    "symbol": stock.get("symbol"),
+                    "name": stock.get("name"),
+                    "market": stock.get("market"),
+                    "security_type": stock.get("securityType"),
+                }
+                for stock in stocks
+            ],
+        }
+
+    @app.get("/api/v1/recommendations")
+    async def recommendations(request: Request) -> dict:
+        engine = get_engine(request)
+        if not engine.toss_client:
+            raise HTTPException(status_code=409, detail="추천 후보 탐색은 토스 API 연결이 필요합니다.")
+        account = engine.broker.account(engine.quotes)
+        equity = Decimal(account["total_equity"]["KRW"])
+        cash = Decimal(account["cash"]["KRW"])
+        budget = min(cash, equity * engine.settings.recommended_trade_ratio)
+        try:
+            ranking_result = await engine.toss_client.rankings(100)
+            ranking_items = [
+                item for item in ranking_result.get("rankings", [])
+                if item.get("currency") == "KRW"
+                and Decimal(item.get("price", {}).get("lastPrice", "0")) > 0
+                and Decimal(item.get("price", {}).get("lastPrice", "0")) <= budget
+            ][:30]
+            symbols = [item["symbol"] for item in ranking_items]
+            stock_items = await engine.toss_client.stocks_info(symbols)
+            stocks_by_symbol = {item["symbol"]: item for item in stock_items}
+            risk_filtered: list[tuple[dict, dict, Decimal, Decimal]] = []
+            for ranking in ranking_items:
+                stock = stocks_by_symbol.get(ranking["symbol"], {})
+                if stock.get("securityType") != "STOCK" or stock.get("isCommonShare") is not True:
+                    continue
+                price = Decimal(ranking["price"]["lastPrice"])
+                market_cap = price * Decimal(stock.get("sharesOutstanding") or "0")
+                if market_cap >= Decimal("1000000000000"):
+                    risk_filtered.append((ranking, stock, price, market_cap))
+            # Analyze a different pre-screened subset on every request.
+            eligible = random.sample(risk_filtered, min(12, len(risk_filtered)))
+            candle_results = await asyncio.wait_for(
+                asyncio.gather(
+                    *(engine.toss_client.candles(item[0]["symbol"], "1d", 120) for item in eligible),
+                    return_exceptions=True,
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            engine.last_error = f"recommendations: {type(exc).__name__}: {exc}"
+            raise HTTPException(status_code=502, detail="추천 후보를 분석하지 못했습니다.") from exc
+
+        candidates: list[dict] = []
+        report_direction = request.app.state.weekly_report.cached_direction()
+        macro_adjustment = 3 if report_direction == "risk_on" else -7 if report_direction == "defensive" else 0
+        for (ranking, stock, price, market_cap), candles in zip(eligible, candle_results):
+            if isinstance(candles, Exception):
+                continue
+            change_rate = Decimal(ranking["price"].get("changeRate", "0"))
+            analysis = analyze_candidate(candles, price, change_rate)
+            if not analysis or not analysis["support_touched"]:
+                continue
+            analysis["score"] = max(0, min(100, analysis["score"] + macro_adjustment))
+            base_quantity = int(budget // price)
+            suggested_quantity = base_quantity // 2 if report_direction == "defensive" else base_quantity
+            candidates.append(
+                {
+                    "symbol": ranking["symbol"],
+                    "name": stock.get("name") or ranking["symbol"],
+                    "price": str(price),
+                    "market_cap": str(market_cap.quantize(Decimal("1"))),
+                    "currency": "KRW",
+                    "quantity": suggested_quantity,
+                    "change_rate": str(change_rate),
+                    "weekly_direction": report_direction,
+                    "macro_adjustment": macro_adjustment,
+                    **analysis,
+                }
+            )
+        random.shuffle(candidates)
+        selected_candidates = candidates[:5]
+        return {
+            "budget": str(budget.quantize(Decimal("1"))),
+            "ratio": str(engine.settings.recommended_trade_ratio),
+            "ranked_at": ranking_result.get("rankedAt"),
+            "weekly_direction": report_direction,
+            "funnel": {
+                "universe": int(ranking_result.get("totalCount") or 2601),
+                "budget_liquidity": len(ranking_items),
+                "risk_filtered": len(eligible),
+                "analyzed": len(candle_results),
+                "qualified": len(candidates),
+            },
+            "candidates": selected_candidates,
+            "disclaimer": "일봉·주봉 지지 확인과 저항 여력을 통과한 PAPER 후보이며 투자 권유가 아닙니다.",
+        }
+
+    @app.get("/api/v1/market/candles")
+    async def market_candles(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9.\-]+$"),
+        interval: str = Query(
+            default="1d", pattern=r"^(1d|1w|1M)$"
+        ),
+        count: int = Query(default=250, ge=1, le=300),
+    ) -> dict:
+        engine = get_engine(request)
+        try:
+            candles = await engine.candles(symbol, interval, count)
+        except Exception as exc:
+            engine.last_error = f"market-candles: {type(exc).__name__}: {exc}"
+            raise HTTPException(
+                status_code=502, detail="캔들 조회에 실패했습니다. 종목과 API 설정을 확인하세요."
+            ) from exc
+        return {"symbol": symbol.upper(), "interval": interval, "candles": serialize(candles)}
+
+    @app.post("/api/v1/market/refresh")
+    async def refresh_market(request: Request) -> dict:
+        engine = get_engine(request)
+        try:
+            quotes = await engine.refresh_market_data()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            engine.last_error = f"market-data: {type(exc).__name__}: {exc}"
+            raise HTTPException(
+                status_code=502, detail="토스 시세 조회에 실패했습니다. 설정과 허용 IP를 확인하세요."
+            ) from exc
+        return {"quotes": serialize(quotes)}
+
     @app.post("/api/v1/market/quotes", status_code=status.HTTP_201_CREATED)
     async def update_quote(payload: QuoteInput, request: Request) -> dict:
         engine = get_engine(request)
@@ -181,6 +417,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         engine.set_quote(quote)
         return serialize(quote)
+
+    @app.websocket("/ws/market/trades")
+    async def realtime_trades(websocket: WebSocket, symbol: str) -> None:
+        await websocket.accept()
+        engine: TradingEngine = websocket.app.state.engine
+        normalized = symbol.strip().upper()
+        if not normalized or len(normalized) > 20 or not all(
+            char.isalnum() or char in ".-" for char in normalized
+        ):
+            await websocket.send_json({"type": "error", "message": "잘못된 종목 코드입니다."})
+            await websocket.close(code=1008)
+            return
+        if not engine.toss_client:
+            await websocket.send_json({"type": "error", "message": "토스 시세 API가 비활성화되어 있습니다."})
+            await websocket.close(code=1008)
+            return
+        try:
+            initial_quote = await engine.lookup_quote(normalized)
+            async for trade in engine.toss_client.trade_stream(normalized, initial_quote.currency):
+                if trade.get("_type") == "connected":
+                    await websocket.send_json({"type": "connected", "symbol": normalized})
+                    continue
+                quote = Quote(
+                    symbol=normalized,
+                    price=Decimal(trade["price"]),
+                    currency=Currency(trade["currency"]),
+                    timestamp=datetime.fromisoformat(trade["timestamp"]),
+                    source="toss",
+                )
+                engine.set_quote(quote)
+                await websocket.send_json(
+                    {
+                        "type": "trade",
+                        "symbol": normalized,
+                        "price": str(quote.price),
+                        "volume": str(trade["volume"]),
+                        "timestamp": quote.timestamp.isoformat(),
+                        "currency": quote.currency.value,
+                    }
+                )
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Realtime trade stream failed: %s", exc)
+            try:
+                await websocket.send_json({"type": "error", "message": "실시간 시세 연결이 끊어졌습니다."})
+                await websocket.close(code=1011)
+            except Exception:
+                pass
 
     @app.get("/api/v1/strategies")
     async def list_strategies(request: Request) -> dict:

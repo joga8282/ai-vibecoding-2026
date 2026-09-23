@@ -1,115 +1,141 @@
-# Paper Trader v0.1
+# ai-vibecoding-2026
 
-토스증권 실시간 시세를 선택적으로 사용해 가상자금으로 자동매매하는 FastAPI MVP입니다.
+바이브코딩 리포지토리
 
-> v0.1은 안전을 위해 `paper` 모드로 고정되어 있으며 실제 주문 기능이 없습니다.
+## 자동매매 서버 실행
 
-## 주요 기능
-
-- KRW·USD 가상계좌와 SQLite 영속화
-- 가격 임계값 전략 자동 실행
-- 수수료, 슬리피지 및 주문금액 한도 적용
-- 중복 주문 방지
-- 엔진 시작·중지와 킬 스위치
-- 선택적 토스증권 현재가 조회
-- 자격 증명 없이 사용할 수 있는 수동 시세 입력 API
-- FastAPI Swagger UI
-
-## 설치 및 실행
+개발 중에는 코드 변경을 자동 반영하도록 PowerShell에서 다음 명령을 사용합니다.
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-브라우저에서 <http://127.0.0.1:8000/docs>를 열면 API를 사용할 수 있습니다.
+- 대시보드: <http://127.0.0.1:8000/>
+- API 문서: <http://127.0.0.1:8000/docs>
+- `--reload`는 개발용이며 실제 거래 모드에서는 사용하지 않습니다.
 
-환경 변수는 [.env.example](.env.example)을 참고하세요. 현재 구현은 `.env` 파일을 자동으로 읽지 않으므로 PowerShell 환경 변수 또는 실행 환경에서 직접 주입합니다.
+### chapter 1
 
-```powershell
-$env:TOSS_CLIENT_ID="발급받은 client id"
-$env:TOSS_CLIENT_SECRET="발급받은 client secret"
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
-```
+---
 
-토스 자격 증명을 설정하지 않으면 `manual` 시세 모드로 실행됩니다. 자격 증명을 설정해도 v0.1은 현재가만 조회하며 계좌 및 주문 API를 호출하지 않습니다.
+ai에게 코딩을 시키자, 제대로!
 
-## 빠른 사용 순서
+### 개념
 
-### 1. 전략 등록
+코딩을 직접하지는 말 것. ai와 협업해서 새로운 프로그램을 만들자
 
-```powershell
-$body = @{
-  strategy_id = "samsung-demo"
-  symbol = "005930"
-  currency = "KRW"
-  quantity = "1"
-  buy_below = "70000"
-  sell_above = "75000"
-  enabled = $true
-} | ConvertTo-Json
+#### 기존 개발 방법
 
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/api/v1/strategies" `
-  -ContentType "application/json" -Body $body
-```
+요구사항 분석 -> 설계(DB/UI) -> 구현/디버깅 -> 테스트 -> 배포 -> 유지보수
 
-### 2. 수동 시세 입력
+### 바이브코딩 방식
 
-토스 자격 증명이 없는 경우 테스트 가격을 입력합니다.
+요구사항정의(PRD) - ai가 코드 생성/디버깅, 테스트 -> 사람 **검증** 수정요청, 직접수정 -> 배포
 
-```powershell
-$quote = @{
-  symbol = "005930"
-  price = "69000"
-  currency = "KRW"
-} | ConvertTo-Json
+-> AI유지보수
 
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/api/v1/market/quotes" `
-  -ContentType "application/json" -Body $quote
-```
+#### 핵심 포인드
 
-### 3. 엔진 시작
+- ai - 주니어/시니어 개발
+- 사람 - pm + 리뷰어
 
-```powershell
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/api/v1/engine/start"
-```
+### 바이브코딩 개발환경
 
-현재가가 `buy_below` 이하이고 해당 종목을 보유하지 않았다면 가상 매수합니다. 보유 중 현재가가 `sell_above` 이상이면 가상 매도합니다.
+- vs code, vs code insider,android studio, ...
 
-### 4. 결과 확인
+### vs code
 
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8000/api/v1/paper/account"
-Invoke-RestMethod "http://127.0.0.1:8000/api/v1/orders"
-Invoke-RestMethod "http://127.0.0.1:8000/api/v1/system/status"
-```
+- 채팅창 - 안쓴다
+- 확장 - 패키지 - codex, claude code for vs code, gemini code assist
 
-### 5. 중지 또는 긴급 차단
+#### Codex
 
-```powershell
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/api/v1/engine/stop"
+- 설치 후 확장 아이콘 아래, codex 아이콘 생성 됨
+- ![](assets/20260917_170925_image.png)
+- 로그인 - 웹브라우저 연결
+- 설정화면 설정 필요
+- sand box 뜨면 설치
+- ![](assets/20260917_171328_image.png)
+- 최종화면
+- 채팅 창 명령 / 여러 LLM에 전달할 명령어 리스트
 
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8000/api/v1/risk/kill-switch"
-```
+#### 맛보기 바이브코딩
 
-## 테스트
+![](assets/20260917_172335_image.png)
 
-```powershell
-python -m unittest discover -v
-python -m compileall -q app tests
-```
+- 제로샷 프롬프트로 요청
+- ![](assets/20260917_172422_image.png)
+-
 
-## 현재 제한사항
+#### CLI codex
 
-- 주문은 시장가 즉시 체결 모델입니다.
-- 부분 체결, 호가 잔량, 세금 및 거래소별 호가 단위는 아직 정밀 모사하지 않습니다.
-- 토스 WebSocket은 아직 연결하지 않고 현재가 REST API만 사용합니다.
-- 관리 API 인증과 UI는 아직 없습니다. 외부 네트워크에 공개하지 마세요.
-- 실제 계좌 주문은 구현하지 않았습니다.
+- 파워셀, 콘솔 창에서 명령어로 수행하는 codex
 
-상세 요구사항은 [prd.md](prd.md)를 참고하세요.
+### 바이브 코딩
+
+- 제로샷 프롬프트 : 아무런 기초지식없이 대화로 바이브 코딩시작
+- 원샷 프롬프트 : 적어도 한줄의 요구사항을 작성해서 바이브코딩시작
+- 퓨샷 프롬프트 : PRD를 작성해서 바이브코딩
+-
+
+## 주식 자동매매 개발환경
+
+### 토스증권 openapi
+
+- https://corp.tossinvest.com/ko/open-api
+- 토스앱 모바일 설치 가입
+- 토스증권 사용 설정
+- 토스증권 pc 웹사이트
+- 사용중인 아이피를 토스증권 ,pc 등록
+- cmd 에서 ipconfig 하면 나의 ip 주소를 알수 있음
+- open api - ip추가해서 내 ip 추가해야됨
+- openapi 키 발급 후 client id, client secret 문자열 보관
+-
+- [https://developers.tossinvest.com/docs](https://developers.tossinvest.com/docs) 토스증권 개발자 센터
+
+`codex 명령어` -
+
+주식 자동매매 시스템을 만들고 싶어. 근데 토스증권 api를 사용할 거야.
+
+https://developers.tossinvest.com/docs
+
+이주소 학인해서 일단 문서 분석해줘
+
+- 나는 파이썬 + fastapi로 자동매매 프로그램을 개발할거야. 이내용도 분석해서  prd.md에 추가해줘
+
+## API 신청
+
+- client id, `client secert`, 컴퓨터 ip 추가
+- cmd > ipconfig로 확인
+- 최초에는 가상금액으로 자동매매를 시작할꺼야. 어느정도 안정화 된 후 실제 계좌금액으로 매매를 할거야. 이 내용도 prd에 추가해줘
+- prd.md를 분석해서 내용을 축약해줘. 내용이 너무 긴거 같아
+
+#### 주식 자동매매 파이썬 프로그램 분석
+
+-`__init__.py` - 일반적으로 파일만 생성. 소스코드 x 프로젝트 폴더가 pip로 설치할 수 있는 패키지화
+
+- `__main__.py` - 파이썬으로 실행될때 가장 먼저 실행되는 메인
+- `__pycache__` - 미리 만들어 놓은 파이썬 실행 파일(캐시)
+- test - 소스코드 테스트 실행을 위한 폴더
+- .env.example-환경설정 예제파일.example을 지우고 사용(보통 복사해서 .env만들어서 쓴다)
+- .env는 깃허브에 업로드 방지위해 .gitignore에 제외파일로 등록
+- requirements.txt = 파이썬 개발환경 패키지 설치리스트 파일
+  - `pip install -r requirements.txt` 로 전부 설치
+- ctrl + , - 설정 - ㅡmouse zoom , minimap 체크
+
+바이브 코딩할때 -지난번에 어디까지 작업했는지 설명해줘
+
+만약에 설정파일이 없으면  .env.example을 만들어줘 파일 내에느 가장 필요한설정값 예시를 작성해줘
+
+- 서버 실행할려면 어떻게 해야해? 명령어를 알려줘
+- 2단계 구현 시작하면서 프론트엔드도 같이 만들어줘
+- ![](assets/20260923_112118_image.png)
+- `구글에서 공인아이피 확인해서 토스설정에 넣어줘야한다`
+- `https://myip.co.kr/util/what-is-myip/`
+- ![](assets/20260923_115021_image.png)
+
+현재까지가 v0.2네 . 프로젝트 폴더에 있는 현재까지 내용을 압축해줘. 프로젝트 폴더에 있는 env에 키는 그대로두고 압축한 .env파일에는 키를 삭제하고 압축해줘
+
+- `flaticon.com - 아이콘이 무료다`
+- 구글에서 png to ico 검색해서 png파일을 favicon.ico으로 바꾼다
+- D:\cho\ai-vibecoding-2026\app\static 여기에 파일을 넣는다

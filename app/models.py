@@ -37,6 +37,17 @@ class Quote:
 
 
 @dataclass(slots=True)
+class Candle:
+    timestamp: datetime
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal
+    currency: Currency
+
+
+@dataclass(slots=True)
 class Position:
     symbol: str
     quantity: Decimal

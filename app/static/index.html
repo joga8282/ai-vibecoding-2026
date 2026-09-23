@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="ko">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/static/favicon.ico" type="image/ico">
+  <meta name="description" content="토스증권 시세 기반 가상자금 자동매매 대시보드">
+  <title>토스 주식 자동매매</title>
+  <script>
+    try { document.documentElement.dataset.theme = localStorage.getItem("trader-theme") || "dark"; }
+    catch { document.documentElement.dataset.theme = "dark"; }
+  </script>
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.3">
+  <script src="/static/app.js?v=0.3.3" defer></script>
+</head>
+
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <div>
+          <p class="eyebrow">TOSS MARKET · PAPER ONLY</p>
+          <h1>토스 AI 주식매매</h1>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button id="refreshAllButton" class="button status-button button-ghost" type="button">새로고침</button>
+        <button id="tossConnectionButton" class="button status-button status-checking" type="button">API 확인 중</button>
+        <button id="tradingModeButton" class="button status-button status-paper" type="button" aria-label="현재 주문 모드">PAPER</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero-grid" aria-label="시스템 요약">
+        <article class="hero-card hero-primary">
+          <div>
+            <p class="eyebrow">거래 엔진</p>
+            <h2 id="engineLabel">중지됨</h2>
+            <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
+          </div>
+          <div class="control-row">
+            <button id="startButton" class="button button-primary" type="button">엔진 시작</button>
+            <button id="stopButton" class="button button-secondary" type="button">중지</button>
+          </div>
+        </article>
+
+        <article class="metric-card">
+          <p class="metric-label">KRW 총자산</p>
+          <p id="krwEquity" class="metric-value">-</p>
+          <p id="krwReturn" class="metric-change">-</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">USD 총자산</p>
+          <p id="usdEquity" class="metric-value">-</p>
+          <p id="usdReturn" class="metric-change">-</p>
+        </article>
+        <article class="metric-card risk-card">
+          <div>
+            <p class="metric-label">안전장치</p>
+            <p id="killSwitchLabel" class="metric-value small">정상</p>
+          </div>
+          <div class="control-row compact">
+            <button id="killButton" class="button button-danger" type="button">긴급 중지</button>
+            <button id="clearKillButton" class="button button-ghost" type="button">해제</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="market-workspace" aria-label="종목 시세 조회">
+        <article class="panel market-panel">
+          <div class="market-toolbar">
+            <div>
+              <p class="eyebrow">MARKET EXPLORER</p>
+              <h2>종목 시세 조회</h2>
+            </div>
+            <form id="marketSearchForm" class="market-search">
+              <input id="marketSymbolInput" name="symbol" value="005930" aria-label="종목명 또는 종목 코드"
+                placeholder="삼성전자, 005930 또는 AAPL" required maxlength="50" autocomplete="off">
+              <button class="button button-primary" type="submit">조회</button>
+            </form>
+          </div>
+
+          <div class="chart-summary">
+            <div class="chart-market-info">
+              <div class="market-detail-row" aria-label="조회 종목 정보">
+                <div><span>종목번호</span><strong id="chartSymbol">005930</strong></div>
+                <div><span>주식명</span><strong id="chartName" class="chart-name-toggle" role="button" tabindex="0" aria-expanded="true" title="클릭하여 차트 접기 또는 펼치기">-</strong></div>
+                <div><span>현재가</span><strong id="chartPrice">-</strong></div>
+                <div><span>통화</span><strong id="chartCurrency">KRW</strong></div>
+              </div>
+              <div class="chart-meta">
+                <span id="chartSource" class="badge badge-muted">대기</span>
+                <span id="chartChange" class="chart-change">시세를 조회하세요</span>
+              </div>
+            </div>
+            <div class="interval-switch" role="group" aria-label="차트 주기">
+              <button class="interval-button active" type="button" data-interval="1d">일봉</button>
+              <button class="interval-button" type="button" data-interval="1w">주봉</button>
+              <button class="interval-button" type="button" data-interval="1M">월봉</button>
+            </div>
+          </div>
+
+          <div id="chartContainer" class="chart-container">
+            <svg id="priceChart" viewBox="0 0 1000 360" preserveAspectRatio="none" role="img" aria-label="가격 차트">
+              <g id="chartGrid"></g>
+              <g id="chartLevels"></g>
+              <g id="chartVolumeBars"></g>
+              <g id="chartMovingAverages"></g>
+              <g id="chartCandles"></g>
+              <g id="chartAxis"></g>
+            </svg>
+            <div id="movingAverageLegend" class="moving-average-legend" aria-label="이동평균선 범례">
+              <span class="ma5">MA5</span><span class="ma20">MA20</span><span class="ma60">MA60</span><span class="ma120">MA120</span>
+            </div>
+            <div class="chart-zoom-hint">마우스 휠: 확대·축소</div>
+            <div id="chartEmpty" class="chart-empty">종목을 조회하면 가격 차트가 표시됩니다.</div>
+            <div id="chartLoading" class="chart-loading" hidden><span></span>시세를 불러오는 중</div>
+          </div>
+
+          <div class="chart-stats">
+            <div><span>오늘 시가</span><strong id="chartOpen">-</strong></div>
+            <div><span>고가</span><strong id="chartHigh">-</strong></div>
+            <div><span>저가</span><strong id="chartLow">-</strong></div>
+            <div><span>거래량</span><strong id="chartVolume">-</strong></div>
+            <div><span>갱신 시각</span><strong id="chartUpdated">-</strong></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="capital-bridge" aria-label="주문 자금 요약">
+        <article class="panel capital-panel">
+          <div class="capital-heading">
+            <div>
+              <p class="eyebrow">TRADING CAPITAL</p>
+              <h2 id="capitalTitle">가상계좌 주문 자금</h2>
+            </div>
+            <span id="capitalMode" class="badge badge-paper">PAPER</span>
+          </div>
+          <div class="capital-values">
+            <div class="capital-value">
+              <span id="capitalAccountLabel">가상계좌 평가금액</span>
+              <strong id="capitalAccountAmount">-</strong>
+              <small>보유 종목 평가금액과 현금을 합산한 금액</small>
+            </div>
+            <div class="capital-arrow" aria-hidden="true">→</div>
+            <div class="capital-value capital-value-accent">
+              <span>이번 추천에 사용할 금액</span>
+              <strong id="capitalRecommendationAmount">-</strong>
+              <small id="capitalRecommendationHelp">설정된 추천 거래 비율 이내에서 가용 현금 사용</small>
+              <button id="recommendationButton" class="button button-primary recommendation-button" type="button">추천 후보 찾기</button>
+            </div>
+          </div>
+        </article>
+        <div id="recommendationResults" class="recommendation-results" hidden>
+          <div class="recommendation-header">
+            <div>
+              <p class="eyebrow">PAPER SCREENING</p>
+              <h2>지지선 근접 추천 후보 TOP 5</h2>
+            </div>
+            <span id="recommendationBudget" class="badge badge-paper">-</span>
+          </div>
+          <p id="recommendationFunnel" class="recommendation-funnel">전체 종목 → 예산·유동성 → 위험 제외 → 지표 분석</p>
+          <div id="recommendationList" class="recommendation-list" aria-live="polite"></div>
+          <p id="recommendationDisclaimer" class="recommendation-disclaimer"></p>
+        </div>
+      </section>
+
+      <section class="content-grid">
+        <div class="stack">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">ACCOUNT</p>
+                <h2>가상계좌</h2>
+              </div>
+              <span class="badge badge-paper">PAPER</span>
+            </div>
+            <div class="account-grid">
+              <div><span>KRW 현금</span><strong id="krwCash">-</strong></div>
+              <div><span>USD 현금</span><strong id="usdCash">-</strong></div>
+              <div><span>체결 주문</span><strong id="filledOrders">-</strong></div>
+              <div><span>거부 주문</span><strong id="rejectedOrders">-</strong></div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">POSITIONS</p>
+                <h2>보유 종목</h2>
+              </div>
+              <span id="positionCount" class="count">0</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>종목</th>
+                    <th>수량</th>
+                    <th>평균가</th>
+                    <th>현재가</th>
+                    <th>평가손익</th>
+                  </tr>
+                </thead>
+                <tbody id="positionsTable"></tbody>
+              </table>
+            </div>
+            <p id="positionsEmpty" class="empty">아직 보유한 종목이 없습니다.</p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">ORDERS</p>
+                <h2>최근 주문</h2>
+              </div>
+              <button id="ordersRefreshButton" class="text-button" type="button">업데이트</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>시각</th>
+                    <th>종목</th>
+                    <th>구분</th>
+                    <th>수량</th>
+                    <th>체결가</th>
+                    <th>상태</th>
+                  </tr>
+                </thead>
+                <tbody id="ordersTable"></tbody>
+              </table>
+            </div>
+            <p id="ordersEmpty" class="empty">주문 내역이 없습니다.</p>
+          </article>
+        </div>
+
+        <aside class="stack">
+          <article class="panel accent-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">MARKET DATA</p>
+                <h2>시세 연결</h2>
+              </div>
+              <span id="marketMode" class="badge badge-muted">MANUAL</span>
+            </div>
+            <p id="marketDescription" class="muted">토스 API 키가 없으면 테스트 시세를 직접 입력할 수 있습니다.</p>
+            <button id="tossRefreshButton" class="button button-secondary full" type="button">토스 현재가 새로고침</button>
+            <div id="quotesList" class="quote-list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">TEST QUOTE</p>
+                <h2>수동 시세 입력</h2>
+              </div>
+            </div>
+            <form id="quoteForm" class="form-grid">
+              <label>종목 코드<input name="symbol" value="005930" required pattern="[A-Za-z0-9.\-]+"></label>
+              <label>통화<select name="currency">
+                  <option value="KRW">KRW</option>
+                  <option value="USD">USD</option>
+                </select></label>
+              <label class="wide">현재가<input name="price" type="number" min="0.0001" step="any" value="69000"
+                  required></label>
+              <button class="button button-secondary full wide" type="submit">테스트 시세 반영</button>
+            </form>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">STRATEGY</p>
+                <h2>가격 조건 전략</h2>
+              </div>
+            </div>
+            <form id="strategyForm" class="form-grid">
+              <label>전략 이름<input name="strategy_id" value="samsung-demo" required></label>
+              <label>종목 코드<input name="symbol" value="005930" required pattern="[A-Za-z0-9.\-]+"></label>
+              <label>통화<select name="currency">
+                  <option value="KRW">KRW</option>
+                  <option value="USD">USD</option>
+                </select></label>
+              <label>수량<input name="quantity" type="number" min="0.0001" step="any" value="1" required></label>
+              <label>매수 기준 이하<input name="buy_below" type="number" min="0.0001" step="any" value="70000"
+                  required></label>
+              <label>매도 기준 이상<input name="sell_above" type="number" min="0.0001" step="any" value="75000"
+                  required></label>
+              <button class="button button-primary full wide" type="submit">전략 저장</button>
+            </form>
+            <div id="strategyList" class="strategy-list"></div>
+          </article>
+        </aside>
+      </section>
+
+      <section class="weekly-report panel" aria-labelledby="weeklyReportTitle">
+        <div class="panel-header weekly-report-header">
+          <div><p class="eyebrow">DAILY &amp; WEEKLY MARKET REPORT</p><h2 id="weeklyReportTitle">시장 리포트 분석</h2></div>
+          <div class="weekly-report-actions">
+            <span id="weeklyDirection" class="badge badge-muted">분석 대기</span>
+          </div>
+        </div>
+        <div class="report-tabs" role="tablist" aria-label="리포트 기간">
+          <button class="report-tab active" type="button" data-report-period="daily">일간 리포트</button>
+          <button class="report-tab" type="button" data-report-period="weekly">주간 리포트</button>
+        </div>
+        <p id="weeklyReportPeriod" class="muted">일간 리포트는 매일 저녁 6시에 갱신됩니다.</p>
+        <div class="weekly-report-grid">
+          <article><h3>해외 주요 이슈 3</h3><div id="globalIssues" class="weekly-issues"><p class="empty">불러오는 중...</p></div></article>
+          <article><h3>국내 주요 이슈 3</h3><div id="domesticIssues" class="weekly-issues"><p class="empty">불러오는 중...</p></div></article>
+        </div>
+        <div class="weekly-guidance">
+          <span>이번 주 투자 방향</span>
+          <strong id="weeklyGuidance">분석 중입니다.</strong>
+          <small id="weeklySourceNote"></small>
+        </div>
+        <div class="favorite-report">
+          <div class="favorite-report-header"><h3>즐겨찾기</h3><button id="clearReportFavorites" class="text-button" type="button">전체 삭제</button></div>
+          <div id="reportFavorites" class="favorite-list"><p class="empty">즐겨찾기한 이슈가 없습니다.</p></div>
+        </div>
+        <p class="recommendation-disclaimer">뉴스 제목 기반 보조지표이며 투자 권유가 아닙니다. PAPER 추천 점수와 제안 수량에만 반영됩니다.</p>
+      </section>
+    </main>
+  </div>
+
+  <button id="themeToggle" class="theme-toggle" type="button" aria-label="화면 테마 변경" aria-pressed="false">
+    <span id="themeIcon" aria-hidden="true">☾</span>
+    <strong id="themeLabel">DARK</strong>
+  </button>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+
+</html>
