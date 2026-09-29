@@ -103,9 +103,12 @@ class PaperBroker:
         quote: Quote,
         side: Side,
         quantity: Decimal,
+        order_budget: Decimal | None = None,
     ) -> Order:
         if quantity <= 0:
             raise ValueError("주문 수량은 0보다 커야 합니다.")
+        if order_budget is not None and (not order_budget.is_finite() or order_budget <= 0):
+            raise ValueError("분할 주문 예산은 양수여야 합니다.")
         async with self._lock:
             existing = next(
                 (order for order in self.orders if order.client_order_id == client_order_id),
@@ -128,7 +131,9 @@ class PaperBroker:
             gross = fill_price * quantity
             fee = gross * self.settings.fee_rate
 
-            if side is Side.BUY and gross > self._max_order_amount(quote.currency):
+            if side is Side.BUY and order_budget is not None and gross + fee > order_budget:
+                order.reason = "tranche-budget-exceeded"
+            elif side is Side.BUY and order_budget is None and gross > self._max_order_amount(quote.currency):
                 order.reason = "max-order-amount-exceeded"
             elif side is Side.BUY:
                 total = gross + fee

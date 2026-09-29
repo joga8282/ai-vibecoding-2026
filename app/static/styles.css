@@ -340,6 +340,70 @@ h2 {
   overflow-x: auto;
 }
 
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.diagnostics-grid > div {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(8, 11, 16, .4);
+}
+
+.diagnostics-grid span,
+.diagnostic-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.diagnostics-grid strong {
+  display: block;
+  margin-top: 7px;
+  font-size: 18px;
+}
+
+.diagnostic-details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+
+.diagnostic-details h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.diagnostic-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.diagnostic-list > div > strong {
+  max-width: 65%;
+  text-align: right;
+}
+
+@media (max-width: 1050px) {
+  .diagnostics-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 680px) {
+  .diagnostics-grid,
+  .diagnostic-details {
+    grid-template-columns: 1fr;
+  }
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -395,50 +459,14 @@ tr:last-child td {
   font-size: 12px;
 }
 
-.form-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-
-.form-grid label {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.form-grid input,
-.form-grid select {
-  width: 100%;
-  height: 42px;
-  margin-top: 7px;
-  padding: 0 12px;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  outline: none;
-  color: var(--text);
-  background: #0b1017;
-  transition: border .15s;
-}
-
-.form-grid input:focus,
-.form-grid select:focus {
-  border-color: var(--blue);
-}
-
-.wide {
-  grid-column: 1 / -1;
-}
-
-.quote-list,
-.strategy-list {
+.quote-list {
   display: flex;
   flex-direction: column;
   gap: 9px;
   margin-top: 16px;
 }
 
-.quote-item,
-.strategy-item {
+.quote-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -449,31 +477,14 @@ tr:last-child td {
   border: 1px solid var(--line);
 }
 
-.quote-item strong,
-.strategy-item strong {
+.quote-item strong {
   display: block;
   font-size: 13px;
 }
 
-.quote-item span,
-.strategy-item span {
+.quote-item span {
   color: var(--muted);
   font-size: 11px;
-}
-
-.strategy-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.mini-button {
-  border: 0;
-  border-radius: 8px;
-  padding: 6px 9px;
-  background: #263249;
-  color: var(--text);
-  font-size: 10px;
 }
 
 .toast {

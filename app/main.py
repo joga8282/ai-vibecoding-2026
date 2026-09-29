@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import random
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -20,7 +19,8 @@ from app.engine import TradingEngine
 from app.models import Currency, Quote, ThresholdStrategy, serialize, utc_now
 from app.paper import PaperBroker
 from app.repository import SnapshotRepository
-from app.recommendations import analyze_candidate
+from app.recommendation_service import build_recommendations
+from app.morning_trader import MorningTrader
 from app.toss import TossMarketClient
 from app.weekly_report import WeeklyReportService
 
@@ -86,6 +86,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.broker = broker
         app.state.engine = engine
         app.state.weekly_report = WeeklyReportService()
+        engine.automation = MorningTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
+        await engine.automation.restore()
         if selected_settings.auto_start:
             await engine.start()
         yield
@@ -175,7 +177,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/paper/account")
     async def paper_account(request: Request) -> dict:
         engine = get_engine(request)
-        return engine.broker.account(engine.quotes)
+        account = engine.broker.account(engine.quotes)
+        account["positions"] = await engine.with_stock_names(account["positions"])
+        return account
 
     @app.get("/api/v1/performance")
     async def performance(request: Request) -> dict:
@@ -203,18 +207,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if engine.running:
             raise HTTPException(status_code=409, detail="엔진을 중지한 뒤 초기화하세요.")
         await engine.broker.reset(payload.cash_krw, payload.cash_usd)
+        await engine.automation.reset()
         return engine.broker.account(engine.quotes)
 
     @app.get("/api/v1/orders")
     async def list_orders(request: Request, limit: int = 100) -> dict:
         if not 1 <= limit <= 1000:
             raise HTTPException(status_code=400, detail="limit은 1~1000이어야 합니다.")
-        orders = get_engine(request).broker.orders[-limit:]
-        return {"orders": serialize(list(reversed(orders)))}
+        engine = get_engine(request)
+        orders = engine.broker.orders[-limit:]
+        return {"orders": await engine.with_stock_names(serialize(list(reversed(orders))))}
 
     @app.get("/api/v1/market/quotes")
     async def list_quotes(request: Request) -> dict:
-        return {"quotes": serialize(list(get_engine(request).quotes.values()))}
+        engine = get_engine(request)
+        return {"quotes": await engine.with_stock_names(serialize(list(engine.quotes.values())))}
 
     @app.get("/api/v1/market/lookup")
     async def lookup_market(
@@ -290,87 +297,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = get_engine(request)
         if not engine.toss_client:
             raise HTTPException(status_code=409, detail="추천 후보 탐색은 토스 API 연결이 필요합니다.")
-        account = engine.broker.account(engine.quotes)
-        equity = Decimal(account["total_equity"]["KRW"])
-        cash = Decimal(account["cash"]["KRW"])
-        budget = min(cash, equity * engine.settings.recommended_trade_ratio)
-        try:
-            ranking_result = await engine.toss_client.rankings(100)
-            ranking_items = [
-                item for item in ranking_result.get("rankings", [])
-                if item.get("currency") == "KRW"
-                and Decimal(item.get("price", {}).get("lastPrice", "0")) > 0
-                and Decimal(item.get("price", {}).get("lastPrice", "0")) <= budget
-            ][:30]
-            symbols = [item["symbol"] for item in ranking_items]
-            stock_items = await engine.toss_client.stocks_info(symbols)
-            stocks_by_symbol = {item["symbol"]: item for item in stock_items}
-            risk_filtered: list[tuple[dict, dict, Decimal, Decimal]] = []
-            for ranking in ranking_items:
-                stock = stocks_by_symbol.get(ranking["symbol"], {})
-                if stock.get("securityType") != "STOCK" or stock.get("isCommonShare") is not True:
-                    continue
-                price = Decimal(ranking["price"]["lastPrice"])
-                market_cap = price * Decimal(stock.get("sharesOutstanding") or "0")
-                if market_cap >= Decimal("1000000000000"):
-                    risk_filtered.append((ranking, stock, price, market_cap))
-            # Analyze a different pre-screened subset on every request.
-            eligible = random.sample(risk_filtered, min(12, len(risk_filtered)))
-            candle_results = await asyncio.wait_for(
-                asyncio.gather(
-                    *(engine.toss_client.candles(item[0]["symbol"], "1d", 120) for item in eligible),
-                    return_exceptions=True,
-                ),
-                timeout=20,
-            )
-        except Exception as exc:
-            engine.last_error = f"recommendations: {type(exc).__name__}: {exc}"
-            raise HTTPException(status_code=502, detail="추천 후보를 분석하지 못했습니다.") from exc
-
-        candidates: list[dict] = []
-        report_direction = request.app.state.weekly_report.cached_direction()
-        macro_adjustment = 3 if report_direction == "risk_on" else -7 if report_direction == "defensive" else 0
-        for (ranking, stock, price, market_cap), candles in zip(eligible, candle_results):
-            if isinstance(candles, Exception):
-                continue
-            change_rate = Decimal(ranking["price"].get("changeRate", "0"))
-            analysis = analyze_candidate(candles, price, change_rate)
-            if not analysis or not analysis["support_touched"]:
-                continue
-            analysis["score"] = max(0, min(100, analysis["score"] + macro_adjustment))
-            base_quantity = int(budget // price)
-            suggested_quantity = base_quantity // 2 if report_direction == "defensive" else base_quantity
-            candidates.append(
-                {
-                    "symbol": ranking["symbol"],
-                    "name": stock.get("name") or ranking["symbol"],
-                    "price": str(price),
-                    "market_cap": str(market_cap.quantize(Decimal("1"))),
-                    "currency": "KRW",
-                    "quantity": suggested_quantity,
-                    "change_rate": str(change_rate),
-                    "weekly_direction": report_direction,
-                    "macro_adjustment": macro_adjustment,
-                    **analysis,
-                }
-            )
-        random.shuffle(candidates)
-        selected_candidates = candidates[:5]
-        return {
-            "budget": str(budget.quantize(Decimal("1"))),
-            "ratio": str(engine.settings.recommended_trade_ratio),
-            "ranked_at": ranking_result.get("rankedAt"),
-            "weekly_direction": report_direction,
-            "funnel": {
-                "universe": int(ranking_result.get("totalCount") or 2601),
-                "budget_liquidity": len(ranking_items),
-                "risk_filtered": len(eligible),
-                "analyzed": len(candle_results),
-                "qualified": len(candidates),
-            },
-            "candidates": selected_candidates,
-            "disclaimer": "일봉·주봉 지지 확인과 저항 여력을 통과한 PAPER 후보이며 투자 권유가 아닙니다.",
-        }
+        return await build_recommendations(engine, request.app.state.weekly_report.cached_direction())
 
     @app.get("/api/v1/market/candles")
     async def market_candles(

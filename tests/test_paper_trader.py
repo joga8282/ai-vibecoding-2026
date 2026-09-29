@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.config import Settings
 from app.engine import TradingEngine
@@ -76,6 +77,25 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(performance["by_currency"]["KRW"]["profit_loss"], "10000")
         self.assertEqual(performance["orders"]["filled"], 2)
 
+    async def test_stock_names_are_cached_without_mutating_orders(self) -> None:
+        self.engine.toss_client = Mock(stocks_info=AsyncMock(return_value=[
+            {"symbol": "005930", "name": "삼성전자"},
+        ]))
+        rows = [{"symbol": "005930", "quantity": "1"}, {"symbol": "005930", "quantity": "2"}]
+        result = await self.engine.with_stock_names(rows)
+        self.assertEqual([row["name"] for row in result], ["삼성전자", "삼성전자"])
+        self.assertNotIn("name", rows[0])
+        await self.engine.with_stock_names(rows)
+        self.engine.toss_client.stocks_info.assert_awaited_once_with(["005930"])
+
+    async def test_name_lookup_failure_preserves_rows_and_backs_off(self) -> None:
+        rows = [{"symbol": "005930"}]
+        self.assertEqual(await self.engine.with_stock_names(rows), [{"symbol": "005930", "name": None}])
+        self.engine.toss_client = Mock(stocks_info=AsyncMock(side_effect=RuntimeError("offline")))
+        for _ in range(2):
+            self.assertEqual(await self.engine.with_stock_names(rows), [{"symbol": "005930", "name": None}])
+        self.engine.toss_client.stocks_info.assert_awaited_once()
+
     async def test_threshold_strategy_trades_automatically(self) -> None:
         strategy = ThresholdStrategy(
             strategy_id="samsung-threshold",
@@ -89,7 +109,8 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
         self.engine.set_quote(
             Quote("005930", Decimal("69000"), Currency.KRW, utc_now())
         )
-        await self.engine.tick()
+        with patch.object(self.engine, "_buy_allowed", new=AsyncMock(return_value=True)):
+            await self.engine.tick()
         self.assertIn("005930", self.broker.positions)
 
         self.engine.set_quote(

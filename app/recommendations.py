@@ -51,17 +51,46 @@ def analyze_candidate(
     candles: list[Candle], current_price: Decimal, change_rate: Decimal
 ) -> dict | None:
     ordered = sorted(candles, key=lambda item: item.timestamp)
-    if len(ordered) < 21 or current_price <= 0:
+    if len(ordered) < 65 or current_price <= 0:
+        return None
+    if any(item.close_price <= 0 or item.low_price <= 0 for item in ordered):
         return None
     closes = [item.close_price for item in ordered]
     volumes = [item.volume for item in ordered]
     ma5 = sum(closes[-5:], Decimal("0")) / Decimal("5")
     ma20 = sum(closes[-20:], Decimal("0")) / Decimal("20")
+    ma60 = sum(closes[-60:], Decimal("0")) / Decimal("60")
+    previous_ma20 = sum(closes[-25:-5], Decimal("0")) / Decimal("20")
+    previous_ma60 = sum(closes[-65:-5], Decimal("0")) / Decimal("60")
+    uptrend = ma20 > ma60 and ma20 > previous_ma20 and ma60 > previous_ma60 and current_price > ma60
+
+    # Population standard deviation of the same 20 closes, including the latest bar.
+    deviation = (sum(((price - ma20) ** 2 for price in closes[-20:]), Decimal("0")) / Decimal("20")).sqrt()
+    bollinger_lower = ma20 - Decimal("2") * deviation
+    bollinger_upper = ma20 + Decimal("2") * deviation
+    bollinger_touched = (
+        deviation > 0
+        and ordered[-1].low_price <= bollinger_lower <= ordered[-1].high_price
+        and current_price >= bollinger_lower
+    )
 
     deltas = [closes[index] - closes[index - 1] for index in range(len(closes) - 14, len(closes))]
     gains = sum((max(delta, Decimal("0")) for delta in deltas), Decimal("0")) / Decimal("14")
     losses = sum((max(-delta, Decimal("0")) for delta in deltas), Decimal("0")) / Decimal("14")
-    rsi = Decimal("100") if losses == 0 else Decimal("100") - Decimal("100") / (Decimal("1") + gains / losses)
+    rsi = (Decimal("50") if gains == 0 else Decimal("100")) if losses == 0 else Decimal("100") - Decimal("100") / (Decimal("1") + gains / losses)
+    return5 = current_price / closes[-6] - Decimal("1")
+    return20 = current_price / closes[-21] - Decimal("1")
+    ma20_distance = current_price / ma20 - Decimal("1")
+    overheating_reasons = []
+    for overheated, label in [
+        (rsi >= Decimal("70"), "RSI 70 이상"),
+        (change_rate >= Decimal("0.07"), "당일 7% 이상 상승"),
+        (return5 >= Decimal("0.10"), "5거래일 10% 이상 상승"),
+        (return20 >= Decimal("0.20"), "20거래일 20% 이상 상승"),
+        (ma20_distance >= Decimal("0.08"), "20일선 대비 8% 이상 상승"),
+    ]:
+        if overheated:
+            overheating_reasons.append(label)
 
     average_volume = sum(volumes[-21:-1], Decimal("0")) / Decimal("20")
     volume_ratio = volumes[-1] / average_volume if average_volume > 0 else Decimal("0")
@@ -81,6 +110,8 @@ def analyze_candidate(
     weekly_confirmed = Decimal("0") <= weekly_support_distance <= Decimal("0.12")
     resistance_room = daily_resistance_upside >= Decimal("0.03") and weekly_resistance_upside >= Decimal("0.05")
     support_touched = (daily_touch or daily_intraday_touch) and weekly_confirmed and resistance_room
+    bollinger_entry = bollinger_touched and current_price >= daily_support and weekly_confirmed and resistance_room
+    eligible = uptrend and not overheating_reasons and (support_touched or bollinger_entry)
 
     score = Decimal("0")
     if current_price > ma5:
@@ -101,6 +132,8 @@ def analyze_candidate(
     if support_touched:
         proximity = max(Decimal("0"), Decimal("1") - daily_support_distance / Decimal("0.03"))
         score += Decimal("10") + proximity * Decimal("10")
+    if bollinger_entry:
+        score += Decimal("10")
 
     reasons: list[str] = []
     if current_price > ma5:
@@ -113,6 +146,10 @@ def analyze_candidate(
         reasons.append("거래량이 20일 평균보다 증가")
     if support_touched:
         reasons.insert(0, "일봉·주봉 지지 확인, 저항 여력 확보")
+    if bollinger_entry:
+        reasons.insert(0, "볼린저 하단 접촉 후 밴드 안 회복")
+    if uptrend:
+        reasons.insert(0, "20·60일선 상승 추세")
     if not reasons:
         reasons.append("거래대금 상위 종목")
 
@@ -120,6 +157,17 @@ def analyze_candidate(
         "score": int(min(Decimal("100"), score).quantize(Decimal("1"))),
         "ma5": str(ma5.quantize(Decimal("0.01"))),
         "ma20": str(ma20.quantize(Decimal("0.01"))),
+        "ma60": str(ma60.quantize(Decimal("0.01"))),
+        "bollinger_lower": str(bollinger_lower.quantize(Decimal("0.01"))),
+        "bollinger_upper": str(bollinger_upper.quantize(Decimal("0.01"))),
+        "bollinger_touched": bollinger_touched,
+        "uptrend": uptrend,
+        "overheated": bool(overheating_reasons),
+        "overheating_reasons": overheating_reasons,
+        "return_5d_percent": str((return5 * 100).quantize(Decimal("0.01"))),
+        "return_20d_percent": str((return20 * 100).quantize(Decimal("0.01"))),
+        "ma20_distance_percent": str((ma20_distance * 100).quantize(Decimal("0.01"))),
+        "eligible": eligible,
         "rsi": str(rsi.quantize(Decimal("0.1"))),
         "volume_ratio": str(volume_ratio.quantize(Decimal("0.01"))),
         "support": str(daily_support.quantize(Decimal("0.01"))),
@@ -133,5 +181,5 @@ def analyze_candidate(
         "daily_resistance_upside_percent": str((daily_resistance_upside * Decimal("100")).quantize(Decimal("0.01"))),
         "weekly_resistance_upside_percent": str((weekly_resistance_upside * Decimal("100")).quantize(Decimal("0.01"))),
         "support_touched": support_touched,
-        "reason": " · ".join(reasons[:2]),
+        "reason": " · ".join(reasons[:4]),
     }

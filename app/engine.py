@@ -10,6 +10,7 @@ from app.config import Settings
 from app.models import Candle, Currency, Quote, Side, ThresholdStrategy, serialize
 from app.paper import PaperBroker
 from app.repository import SnapshotRepository
+from app.recommendations import analyze_candidate
 from app.toss import TossMarketClient
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,36 @@ class TradingEngine:
         self._attempted_signal: dict[str, Side] = {}
         self._task: asyncio.Task | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._buy_candles: dict[str, tuple[datetime, list[Candle]]] = {}
+        self.buy_filter_status: dict[str, str] = {}
+        self._stock_names: dict[str, tuple[datetime, str | None]] = {}
+        self._stock_names_lock = asyncio.Lock()
+        self.automation = None
+
+    async def with_stock_names(self, rows: list[dict]) -> list[dict]:
+        """Enrich display rows without changing saved orders or positions."""
+        symbols = {row["symbol"] for row in rows}
+        if self.toss_client and symbols:
+            async with self._stock_names_lock:
+                now = datetime.now(timezone.utc)
+                missing = sorted(symbol for symbol in symbols if (
+                    symbol not in self._stock_names or self._stock_names[symbol][0] <= now
+                ))
+                for offset in range(0, len(missing), 200):
+                    batch = missing[offset:offset + 200]
+                    # Cache misses/failures briefly to avoid polling the metadata API.
+                    for symbol in batch:
+                        previous = self._stock_names.get(symbol)
+                        self._stock_names[symbol] = (now + timedelta(minutes=1), previous[1] if previous else None)
+                    try:
+                        stocks = await asyncio.wait_for(self.toss_client.stocks_info(batch), timeout=5)
+                        for stock in stocks:
+                            name = stock.get("name")
+                            if stock.get("symbol") in symbols and isinstance(name, str) and name.strip():
+                                self._stock_names[stock["symbol"]] = (now + timedelta(hours=24), name.strip())
+                    except Exception as exc:
+                        logger.warning("Stock name lookup failed: %s", exc)
+        return [{**row, "name": self._stock_names.get(row["symbol"], (None, None))[1]} for row in rows]
 
     async def restore(self) -> None:
         snapshot = await self.repository.load(self.snapshot_name)
@@ -62,6 +93,12 @@ class TradingEngine:
         async with self._lifecycle_lock:
             if self.running:
                 return
+            if self.kill_switch:
+                raise RuntimeError("킬 스위치가 활성화되어 있습니다.")
+            if self.settings.mode != "paper":
+                raise RuntimeError("가상계좌 PAPER 주문만 지원합니다.")
+            if self.automation:
+                await self.automation.prepare()
             if self.kill_switch:
                 raise RuntimeError("킬 스위치가 활성화되어 있습니다.")
             self.running = True
@@ -200,6 +237,7 @@ class TradingEngine:
             raise RuntimeError("토스 API 자격 증명이 설정되지 않았습니다.")
         symbols = sorted(
             {strategy.symbol for strategy in self.strategies.values() if strategy.enabled}
+            | set(self.broker.positions)
         )
         if not symbols:
             raise RuntimeError("활성화된 전략이 없어 조회할 종목이 없습니다.")
@@ -222,20 +260,64 @@ class TradingEngine:
             logger.exception("Trading engine stopped after an unexpected error")
 
     async def tick(self) -> None:
+        if self.automation:
+            await self.automation.tick()
+            self.last_tick_at = datetime.now(timezone.utc)
+            return
         enabled = [strategy for strategy in self.strategies.values() if strategy.enabled]
+        market_ready = True
         if self.toss_client and enabled:
             try:
                 await self.refresh_market_data()
             except Exception as exc:
+                market_ready = False
                 self.last_error = f"market-data: {type(exc).__name__}: {exc}"
                 logger.warning("Toss market data refresh failed: %s", exc)
 
         if not self.kill_switch:
             for strategy in enabled:
-                await self._evaluate(strategy)
+                await self._evaluate(strategy, allow_buy=market_ready)
         self.last_tick_at = datetime.now(timezone.utc)
 
-    async def _evaluate(self, strategy: ThresholdStrategy) -> None:
+    async def _buy_allowed(self, quote: Quote) -> bool:
+        symbol = quote.symbol
+        try:
+            if not self.toss_client:
+                self.buy_filter_status[symbol] = "일봉 데이터가 없어 신규 매수 보류"
+                return False
+            now = datetime.now(timezone.utc)
+            cached = self._buy_candles.get(symbol)
+            if not cached or now - cached[0] >= timedelta(seconds=60):
+                candles = await asyncio.wait_for(self.toss_client.candles(symbol, "1d", 120), timeout=10)
+                candles = sorted(candles, key=lambda item: item.timestamp)
+                self._buy_candles[symbol] = (now, candles)
+            else:
+                candles = cached[1]
+            if len(candles) < 65 or now - candles[-1].timestamp > timedelta(days=7):
+                self.buy_filter_status[symbol] = "일봉 데이터 부족 또는 오래된 데이터로 매수 보류"
+                return False
+            market_timezone = timezone(timedelta(hours=9)) if quote.currency is Currency.KRW else timezone.utc
+            quote_date = quote.timestamp.astimezone(market_timezone).date()
+            previous_bars = [bar for bar in candles if bar.timestamp.astimezone(market_timezone).date() < quote_date]
+            if not previous_bars or previous_bars[-1].close_price <= 0:
+                self.buy_filter_status[symbol] = "전일 종가 확인 실패로 매수 보류"
+                return False
+            change_rate = quote.price / previous_bars[-1].close_price - Decimal("1")
+            analysis = analyze_candidate(candles, quote.price, change_rate)
+            if not analysis or not analysis["uptrend"]:
+                self.buy_filter_status[symbol] = "상승 추세 미충족으로 매수 보류"
+                return False
+            if analysis["overheated"]:
+                self.buy_filter_status[symbol] = "과열 제외: " + ", ".join(analysis["overheating_reasons"])
+                return False
+            self.buy_filter_status[symbol] = "상승 추세·과열 제외 통과"
+            return True
+        except Exception as exc:
+            self.buy_filter_status[symbol] = "일봉 분석 실패로 매수 보류"
+            logger.warning("Buy filter failed for %s: %s", symbol, exc)
+            return False
+
+    async def _evaluate(self, strategy: ThresholdStrategy, *, allow_buy: bool = True) -> None:
         quote = self.quotes.get(strategy.symbol)
         if not quote or quote.currency is not strategy.currency:
             return
@@ -250,6 +332,14 @@ class TradingEngine:
             self._attempted_signal.pop(strategy.strategy_id, None)
             return
         if self._attempted_signal.get(strategy.strategy_id) is side:
+            return
+        if side is Side.BUY:
+            if not allow_buy:
+                self.buy_filter_status[strategy.symbol] = "현재가 갱신 실패로 매수 보류"
+                return
+            if not await self._buy_allowed(quote):
+                return
+        if self.kill_switch or not strategy.enabled:
             return
         self._attempted_signal[strategy.strategy_id] = side
         client_order_id = (
@@ -273,6 +363,8 @@ class TradingEngine:
             "last_error": self.last_error,
             "strategy_count": len(self.strategies),
             "quote_count": len(self.quotes),
+            "buy_filter_status": dict(self.buy_filter_status),
+            "automation": self.automation.status() if self.automation else None,
         }
 
     async def _persist(self) -> None:

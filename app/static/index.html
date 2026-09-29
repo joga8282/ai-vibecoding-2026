@@ -11,8 +11,8 @@
     try { document.documentElement.dataset.theme = localStorage.getItem("trader-theme") || "dark"; }
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.3.3">
-  <script src="/static/app.js?v=0.3.3" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.6">
+  <script src="/static/app.js?v=0.7.0" defer></script>
 </head>
 
 <body>
@@ -39,9 +39,13 @@
             <p class="eyebrow">거래 엔진</p>
             <h2 id="engineLabel">중지됨</h2>
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
+            <p id="autoBudgetStatus" class="muted">08:00~08:05 첫 진입 · 1종목 10분할 · 가용 원화 전액 예산</p>
+            <p class="muted">20분 간격 조정 확인 + 첫 매수가 대비 0.2% 하락마다 추가 매수 · 매도 시 전량 청산</p>
+            <p class="muted">순수익 +2.5% 익절 · -3% 손절 · 15:10 청산 시도</p>
+            <p class="muted">매수 후 10분 내 +2% 급등 시 고점 추적 · 고점 대비 -3% 매도</p>
           </div>
           <div class="control-row">
-            <button id="startButton" class="button button-primary" type="button">엔진 시작</button>
+            <button id="startButton" class="button button-primary" type="button">가상 자동매매 시작</button>
             <button id="stopButton" class="button button-secondary" type="button">중지</button>
           </div>
         </article>
@@ -64,67 +68,6 @@
           <div class="control-row compact">
             <button id="killButton" class="button button-danger" type="button">긴급 중지</button>
             <button id="clearKillButton" class="button button-ghost" type="button">해제</button>
-          </div>
-        </article>
-      </section>
-
-      <section class="market-workspace" aria-label="종목 시세 조회">
-        <article class="panel market-panel">
-          <div class="market-toolbar">
-            <div>
-              <p class="eyebrow">MARKET EXPLORER</p>
-              <h2>종목 시세 조회</h2>
-            </div>
-            <form id="marketSearchForm" class="market-search">
-              <input id="marketSymbolInput" name="symbol" value="005930" aria-label="종목명 또는 종목 코드"
-                placeholder="삼성전자, 005930 또는 AAPL" required maxlength="50" autocomplete="off">
-              <button class="button button-primary" type="submit">조회</button>
-            </form>
-          </div>
-
-          <div class="chart-summary">
-            <div class="chart-market-info">
-              <div class="market-detail-row" aria-label="조회 종목 정보">
-                <div><span>종목번호</span><strong id="chartSymbol">005930</strong></div>
-                <div><span>주식명</span><strong id="chartName" class="chart-name-toggle" role="button" tabindex="0" aria-expanded="true" title="클릭하여 차트 접기 또는 펼치기">-</strong></div>
-                <div><span>현재가</span><strong id="chartPrice">-</strong></div>
-                <div><span>통화</span><strong id="chartCurrency">KRW</strong></div>
-              </div>
-              <div class="chart-meta">
-                <span id="chartSource" class="badge badge-muted">대기</span>
-                <span id="chartChange" class="chart-change">시세를 조회하세요</span>
-              </div>
-            </div>
-            <div class="interval-switch" role="group" aria-label="차트 주기">
-              <button class="interval-button active" type="button" data-interval="1d">일봉</button>
-              <button class="interval-button" type="button" data-interval="1w">주봉</button>
-              <button class="interval-button" type="button" data-interval="1M">월봉</button>
-            </div>
-          </div>
-
-          <div id="chartContainer" class="chart-container">
-            <svg id="priceChart" viewBox="0 0 1000 360" preserveAspectRatio="none" role="img" aria-label="가격 차트">
-              <g id="chartGrid"></g>
-              <g id="chartLevels"></g>
-              <g id="chartVolumeBars"></g>
-              <g id="chartMovingAverages"></g>
-              <g id="chartCandles"></g>
-              <g id="chartAxis"></g>
-            </svg>
-            <div id="movingAverageLegend" class="moving-average-legend" aria-label="이동평균선 범례">
-              <span class="ma5">MA5</span><span class="ma20">MA20</span><span class="ma60">MA60</span><span class="ma120">MA120</span>
-            </div>
-            <div class="chart-zoom-hint">마우스 휠: 확대·축소</div>
-            <div id="chartEmpty" class="chart-empty">종목을 조회하면 가격 차트가 표시됩니다.</div>
-            <div id="chartLoading" class="chart-loading" hidden><span></span>시세를 불러오는 중</div>
-          </div>
-
-          <div class="chart-stats">
-            <div><span>오늘 시가</span><strong id="chartOpen">-</strong></div>
-            <div><span>고가</span><strong id="chartHigh">-</strong></div>
-            <div><span>저가</span><strong id="chartLow">-</strong></div>
-            <div><span>거래량</span><strong id="chartVolume">-</strong></div>
-            <div><span>갱신 시각</span><strong id="chartUpdated">-</strong></div>
           </div>
         </article>
       </section>
@@ -246,56 +189,41 @@
               </div>
               <span id="marketMode" class="badge badge-muted">MANUAL</span>
             </div>
-            <p id="marketDescription" class="muted">토스 API 키가 없으면 테스트 시세를 직접 입력할 수 있습니다.</p>
+            <p id="marketDescription" class="muted">토스 API 연결 상태를 확인하고 있습니다.</p>
             <button id="tossRefreshButton" class="button button-secondary full" type="button">토스 현재가 새로고침</button>
             <div id="quotesList" class="quote-list"></div>
           </article>
 
-          <article class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">TEST QUOTE</p>
-                <h2>수동 시세 입력</h2>
-              </div>
-            </div>
-            <form id="quoteForm" class="form-grid">
-              <label>종목 코드<input name="symbol" value="005930" required pattern="[A-Za-z0-9.\-]+"></label>
-              <label>통화<select name="currency">
-                  <option value="KRW">KRW</option>
-                  <option value="USD">USD</option>
-                </select></label>
-              <label class="wide">현재가<input name="price" type="number" min="0.0001" step="any" value="69000"
-                  required></label>
-              <button class="button button-secondary full wide" type="submit">테스트 시세 반영</button>
-            </form>
-          </article>
-
-          <article class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">STRATEGY</p>
-                <h2>가격 조건 전략</h2>
-              </div>
-            </div>
-            <form id="strategyForm" class="form-grid">
-              <label>전략 이름<input name="strategy_id" value="samsung-demo" required></label>
-              <label>종목 코드<input name="symbol" value="005930" required pattern="[A-Za-z0-9.\-]+"></label>
-              <label>통화<select name="currency">
-                  <option value="KRW">KRW</option>
-                  <option value="USD">USD</option>
-                </select></label>
-              <label>수량<input name="quantity" type="number" min="0.0001" step="any" value="1" required></label>
-              <label>매수 기준 이하<input name="buy_below" type="number" min="0.0001" step="any" value="70000"
-                  required></label>
-              <label>매도 기준 이상<input name="sell_above" type="number" min="0.0001" step="any" value="75000"
-                  required></label>
-              <button class="button button-primary full wide" type="submit">전략 저장</button>
-            </form>
-            <div id="strategyList" class="strategy-list"></div>
-          </article>
         </aside>
       </section>
 
+      <section class="panel diagnostics-panel" aria-labelledby="diagnosticsTitle">
+        <div class="panel-header">
+          <div><p class="eyebrow">TRADE DIAGNOSTICS</p><h2 id="diagnosticsTitle">오늘 매매 조건 확인</h2></div>
+          <span id="diagnosticsDate" class="badge badge-paper">-</span>
+        </div>
+        <p id="diagnosticsResult" class="muted">자동매매 실행 기록을 기다리고 있습니다.</p>
+        <div class="diagnostics-grid">
+          <div><span>조건 검색</span><strong id="diagnosticScans">0회</strong></div>
+          <div><span>누적 종목 분석</span><strong id="diagnosticAnalyzed">0개</strong></div>
+          <div><span>조건 통과</span><strong id="diagnosticQualified">0개</strong></div>
+          <div><span>매수 주문 시도</span><strong id="diagnosticBuyAttempts">0회</strong></div>
+          <div><span>매수 체결</span><strong id="diagnosticBuyFilled">0회</strong></div>
+          <div><span>검색 오류</span><strong id="diagnosticErrors">0회</strong></div>
+        </div>
+        <div class="diagnostic-details">
+          <article><h3>누적 미충족 사유</h3><div id="diagnosticReasons" class="diagnostic-list"><p class="empty">기록 없음</p></div></article>
+          <article><h3>마지막 검색 종목</h3><div id="diagnosticSymbols" class="diagnostic-list"><p class="empty">기록 없음</p></div></article>
+        </div>
+        <p id="diagnosticLastScan" class="muted"></p>
+      </section>
+
+      <section class="panel" aria-label="최근 7일 가상 단타 성과">
+        <h2>최근 7일 단타 수익률</h2>
+        <p id="scalpSummary" class="muted">실제 가상 주문이 쌓이면 날짜별로 비교합니다.</p>
+        <div class="table-wrap"><table><thead><tr><th>날짜</th><th>상태</th><th>매수원가</th><th>실현손익</th><th>수익률</th></tr></thead><tbody id="scalpDays"></tbody></table></div>
+        <p class="muted">수수료 포함 · 미청산은 수익률에서 제외 · 서버가 켜져 있어야 자동 청산됩니다.</p>
+      </section>
       <section class="weekly-report panel" aria-labelledby="weeklyReportTitle">
         <div class="panel-header weekly-report-header">
           <div><p class="eyebrow">DAILY &amp; WEEKLY MARKET REPORT</p><h2 id="weeklyReportTitle">시장 리포트 분석</h2></div>
