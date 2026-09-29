@@ -11,8 +11,8 @@
     try { document.documentElement.dataset.theme = localStorage.getItem("trader-theme") || "dark"; }
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.3.6">
-  <script src="/static/app.js?v=0.7.0" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.8">
+  <script src="/static/app.js?v=0.7.5" defer></script>
 </head>
 
 <body>
@@ -39,9 +39,9 @@
             <p class="eyebrow">거래 엔진</p>
             <h2 id="engineLabel">중지됨</h2>
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
-            <p id="autoBudgetStatus" class="muted">08:00~08:05 첫 진입 · 1종목 10분할 · 가용 원화 전액 예산</p>
+            <p id="autoBudgetStatus" class="muted">대형주·등록 장기 테마 · 일봉 하단 매수 / 상단 매도 · 여러 날 보유</p>
             <p class="muted">20분 간격 조정 확인 + 첫 매수가 대비 0.2% 하락마다 추가 매수 · 매도 시 전량 청산</p>
-            <p class="muted">순수익 +2.5% 익절 · -3% 손절 · 15:10 청산 시도</p>
+            <p class="muted">평일 09:00~15:30 · 오후에도 조건 충족 시 매수 · 5분 간격 확인 · 일봉 하단 매수 / 상단 매도 · 시간 청산 없음</p>
             <p class="muted">매수 후 10분 내 +2% 급등 시 고점 추적 · 고점 대비 -3% 매도</p>
           </div>
           <div class="control-row">
@@ -96,16 +96,33 @@
             </div>
           </div>
         </article>
+        <article class="panel strategy-panel" aria-labelledby="strategyTitle">
+          <div class="panel-header">
+            <div><p class="eyebrow">ACTIVE STRATEGY</p><h2 id="strategyTitle">현재 매매전략</h2></div>
+            <span class="badge badge-ok">SWING-V1</span>
+          </div>
+          <div class="strategy-grid">
+            <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small>국내 보통주 · 시가총액 1조 원 이상</small></div>
+            <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
+            <div><span>매수</span><strong>BB(20,2) 하단 이하</strong><small>세 조건을 모두 충족해야 자동 매수</small></div>
+            <div><span>매도</span><strong>BB(20,2) 상단 이상</strong><small>또는 보유 종목의 전량 매도 버튼</small></div>
+            <div><span>운영시간</span><strong>평일 09:00~15:30</strong><small>오전·오후 5분 간격 검색</small></div>
+            <div><span>자금관리</span><strong>최대 5종목</strong><small>평가금액의 50% 한도 · PAPER 전용</small></div>
+            <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>
+          </div>
+          <p class="muted">검색 결과에서 자동 매수 조건 통과 종목과 조건에 가까운 관찰 후보를 구분합니다. 관찰 후보는 자동 매수되지 않습니다.</p>
+        </article>
         <div id="recommendationResults" class="recommendation-results" hidden>
           <div class="recommendation-header">
             <div>
               <p class="eyebrow">PAPER SCREENING</p>
-              <h2>지지선 근접 추천 후보 TOP 5</h2>
+              <h2>테마 스윙 매수 후보 TOP 5</h2>
             </div>
             <span id="recommendationBudget" class="badge badge-paper">-</span>
           </div>
           <p id="recommendationFunnel" class="recommendation-funnel">전체 종목 → 예산·유동성 → 위험 제외 → 지표 분석</p>
           <div id="recommendationList" class="recommendation-list" aria-live="polite"></div>
+          <div id="recommendationWatchlist" class="recommendation-watchlist"></div>
           <p id="recommendationDisclaimer" class="recommendation-disclaimer"></p>
         </div>
       </section>
@@ -145,12 +162,14 @@
                     <th>평균가</th>
                     <th>현재가</th>
                     <th>평가손익</th>
+                    <th>청산</th>
                   </tr>
                 </thead>
                 <tbody id="positionsTable"></tbody>
               </table>
             </div>
             <p id="positionsEmpty" class="empty">아직 보유한 종목이 없습니다.</p>
+            <p class="muted">전량 매도: 목표가와 관계없이 현재 시세로 가상 청산합니다. 국내 종목 · 평일 09:00~15:30 · 당일 자동 재매수 제외</p>
           </article>
 
           <article class="panel">
@@ -218,8 +237,8 @@
         <p id="diagnosticLastScan" class="muted"></p>
       </section>
 
-      <section class="panel" aria-label="최근 7일 가상 단타 성과">
-        <h2>최근 7일 단타 수익률</h2>
+      <section class="panel" aria-label="가상 스윙투자 누적 성과">
+        <h2>스윙투자 누적 성과</h2>
         <p id="scalpSummary" class="muted">실제 가상 주문이 쌓이면 날짜별로 비교합니다.</p>
         <div class="table-wrap"><table><thead><tr><th>날짜</th><th>상태</th><th>매수원가</th><th>실현손익</th><th>수익률</th></tr></thead><tbody id="scalpDays"></tbody></table></div>
         <p class="muted">수수료 포함 · 미청산은 수익률에서 제외 · 서버가 켜져 있어야 자동 청산됩니다.</p>

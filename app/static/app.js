@@ -9,6 +9,7 @@ const state = {
   reportLookup: {},
 };
 let toastTimer;
+const closingPositions = new Set();
 
 function applyTheme(theme) {
   const selected = theme === "light" ? "light" : "dark";
@@ -27,7 +28,9 @@ async function request(path, options = {}) {
     ...options,
   });
   const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.detail || `요청 실패 (${response.status})`);
+  if (!response.ok) throw new Error(payload?.detail || (response.status >= 500
+    ? `서버가 요청을 처리하지 못했습니다 (${response.status}). 잠시 후 다시 조회해 주세요.`
+    : `요청 실패 (${response.status})`));
   return payload;
 }
 
@@ -94,15 +97,16 @@ function renderStatus(status, risk) {
   $("#engineLabel").textContent = status.running ? "자동매매 실행 중" : "자동매매 중지됨";
   $("#engineDetail").textContent = status.last_error
     ? `오류: ${status.last_error}`
-    : status.automation?.message || `v${status.version} · ${status.market_data.toUpperCase()} 시세`;
+    : [status.automation?.execution_state, status.automation?.message].filter(Boolean).join(" · ") || `v${status.version} · ${status.market_data.toUpperCase()} 시세`;
   const auto = status.automation;
+  if ($("#signalObservationCount")) $("#signalObservationCount").textContent = `${number(auto?.signal_observation_count || 0, "KRW")}건`;
   renderDiagnostics(auto?.diagnostics);
   $("#autoBudgetStatus").textContent = auto && Number(auto.budget) > 0
-    ? `가상 예산 ${money(auto.budget, "KRW")} · ${auto.tranches_filled ?? 0}/${auto.split_count ?? 10}차 · 누적 매수 ${money(auto.spent, "KRW")} · 남은 예산 ${money(auto.remaining, "KRW")}`
-    : "08:00~08:05 첫 진입 · 1종목 10분할 · 가용 원화 전액 예산";
+    ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 원가 ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
+    : "대형주·등록 장기 테마 · 일봉 하단 매수 / 상단 매도 · 여러 날 보유";
   const weekly = auto?.weekly;
-  $("#scalpSummary").textContent = weekly ? `최근 7일 실현손익 ${money(weekly.realized_profit, "KRW")} · 매수원가 대비 ${weekly.return_percent ?? "-"}%` : "기록 대기";
-  $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
+  $("#scalpSummary").textContent = weekly ? `누적 실현손익 ${money(weekly.realized_profit, "KRW")} · 청산 매수원가 대비 ${weekly.return_percent ?? "-"}% · 보유 중 제외` : "기록 대기";
+  $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)} · ${escapeHtml(day.name || day.symbol || "")}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
   $("#startButton").textContent = auto && Number(auto.budget) > 0 ? "가상 자동매매 재개" : "가상 자동매매 시작";
   $("#startButton").disabled = status.running || status.kill_switch;
   $("#stopButton").disabled = !status.running;
@@ -174,7 +178,7 @@ function renderCapital(account, risk, status) {
   const availableCash = Number(account.cash.KRW || 0);
   const tradeRatio = Number(risk.recommended_trade_ratio ?? 0.5);
   const hasSession = Number(status.automation?.budget) > 0;
-  const recommendationAmount = hasSession ? Number(status.automation.remaining) : availableCash;
+  const recommendationAmount = hasSession ? Number(status.automation.remaining) : Math.min(availableCash, accountAmount * tradeRatio);
   const ratioPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(tradeRatio * 100);
   $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
@@ -183,8 +187,8 @@ function renderCapital(account, risk, status) {
   $("#capitalAccountAmount").textContent = money(accountAmount, "KRW");
   $("#capitalRecommendationAmount").textContent = money(recommendationAmount, "KRW");
   $("#capitalRecommendationHelp").textContent = hasSession
-    ? `시작 예산 ${money(status.automation.budget, "KRW")} 중 남은 매수 예산 · 매도 후 재투자 없음`
-    : "가용 원화 전액을 10분할 예산으로 사용 · 수수료 포함 · 미충족 회차는 현금 유지";
+    ? `평가금액의 ${ratioPercent}% 한도에서 보유 원가를 제외한 예산 · 최대 5종목 · 매도 후 재사용`
+    : `평가금액의 ${ratioPercent}%를 스윙 예산으로 사용 · 최대 5종목 · 종목별 주문 한도 적용`;
 }
 
 function renderRecommendations(payload) {
@@ -193,15 +197,15 @@ function renderRecommendations(payload) {
   $("#recommendationBudget").textContent = `사용 금액 ${money(payload.budget, "KRW")}`;
   $("#recommendationDisclaimer").textContent = payload.disclaimer;
   const funnel = payload.funnel || {};
-  $("#recommendationFunnel").textContent = `전체 ${number(funnel.universe || 0, "KRW")}개 → 예산·유동성 ${number(funnel.budget_liquidity || 0, "KRW")}개 → 위험 제외 ${number(funnel.risk_filtered || 0, "KRW")}개 → 지표 분석 ${number(funnel.analyzed || 0, "KRW")}개`;
+  $("#recommendationFunnel").textContent = `${new Date().toLocaleTimeString("ko-KR")} 조회 완료 · 등록 테마 ${number(funnel.universe || 0, "KRW")}개 → 시세 확인 ${number(funnel.budget_liquidity || 0, "KRW")}개 → 대형주 필터 ${number(funnel.risk_filtered || 0, "KRW")}개 → 지표 분석 ${number(funnel.analyzed || 0, "KRW")}개 → 조건 충족 ${number(funnel.qualified ?? payload.candidates.length, "KRW")}개`;
   $("#recommendationList").innerHTML = payload.candidates.length
-    ? payload.candidates.map((item, index) => `<article class="recommendation-card">
+    ? `<h3 class="result-heading">자동 매수 조건 통과</h3>` + payload.candidates.map((item, index) => `<article class="recommendation-card">
         <div class="recommendation-rank">#${index + 1} · <strong>${item.score}점</strong></div>
         <h3 title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h3>
         <span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
         <div class="recommendation-metrics">
-          ${item.strategy === "morning-v1" ? `<div>볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 반등 확인</div><div>08:00~08:05 첫 진입 · 10분할 · +2.5% 목표</div><div>시가총액 ${marketCap(item.market_cap)}</div>` : `
+          ${item.strategy === "swing-v1" ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>일봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 매수 기준</div><div>일봉 볼린저 상단 ${number(item.bollinger_upper, item.currency)} · 매도 기준</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)} · 상승 추세</div><div>완료 일봉 BB(20,2) · 다일 보유</div>` : `
           <div>시가총액 ${marketCap(item.market_cap)}</div>
           <div>일봉 지지 ${number(item.daily_support, item.currency)} · 저항 ${number(item.daily_resistance, item.currency)}</div>
           <div>주봉 지지 ${number(item.weekly_support, item.currency)} · 저항 ${number(item.weekly_resistance, item.currency)}</div>
@@ -216,9 +220,20 @@ function renderRecommendations(payload) {
           `}
         </div>
         <p class="recommendation-reason">${escapeHtml(item.reason)}</p>
-        <div class="recommendation-quantity">${item.strategy === "morning-v1" ? "1차 분할 매수 예상" : "종목별 배분·주문 한도 적용 시 최대"} ${number(item.quantity, "KRW")}주</div>
+        <div class="recommendation-quantity">종목별 배분·주문 한도 적용 시 최대 ${number(item.quantity, "KRW")}주</div>
       </article>`).join("")
-    : '<p class="empty">현재 조건에 맞는 추천 후보가 없습니다.</p>';
+    : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
+  const watchlist = payload.watchlist || [];
+  $("#recommendationWatchlist").innerHTML = watchlist.length
+    ? `<h3 class="result-heading">조건 근접 관찰 후보 <small>자동 매수 안 함</small></h3><div class="recommendation-list">${watchlist.map((item, index) => `<article class="recommendation-card watch-card">
+        <div class="recommendation-rank">관찰 #${index + 1} · <strong>${item.conditions_passed}/${item.conditions_total} 조건 통과</strong></div>
+        <h3>${escapeHtml(item.name)}</h3><span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
+        <div class="recommendation-price">${money(item.price, item.currency)}</div>
+        <div class="recommendation-metrics"><div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 현재가 거리 ${escapeHtml(item.band_distance_percent)}%</div></div>
+        <p class="recommendation-reason">미충족: ${escapeHtml((item.rejection_reasons || []).join(" · "))}</p>
+        <button type="button" class="button button-secondary full" data-test-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>1주 PAPER 테스트 매수</button>
+      </article>`).join("")}</div>`
+    : "";
   container.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -299,6 +314,7 @@ function renderPositions(positions) {
       <td>${number(position.average_price, position.currency)}</td>
       <td>${number(position.market_price, position.currency)}</td>
       <td class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${number(pnl, position.currency)}</td>
+      <td><button type="button" class="button button-danger" data-close-position="${escapeHtml(position.symbol)}" ${closingPositions.has(position.symbol) || position.currency !== "KRW" ? "disabled" : ""} aria-label="${escapeHtml(position.name || position.symbol)} 가상 전량 매도">${closingPositions.has(position.symbol) ? "매도 중…" : "전량 매도"}</button></td>
     </tr>`;
   }).join("");
 }
@@ -348,6 +364,44 @@ async function action(path, message) {
   } catch (error) { toast(error.message, true); }
 }
 
+$("#positionsTable").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-close-position]");
+  if (!button || button.disabled) return;
+  const symbol = button.dataset.closePosition;
+  if (closingPositions.has(symbol)) return;
+  closingPositions.add(symbol);
+  button.disabled = true;
+  button.textContent = "매도 중…";
+  try {
+    await request(`${API}/paper/positions/${encodeURIComponent(symbol)}/close`, { method: "POST" });
+    toast(`${symbol} 가상 전량 매도 완료 · 당일 자동 재매수 제외`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    await loadAll(true);
+    closingPositions.delete(symbol);
+    if (state.account) renderPositions(state.account.positions);
+  }
+});
+
+$("#recommendationWatchlist").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-test-buy]");
+  if (!button || button.disabled) return;
+  const symbol = button.dataset.testBuy;
+  if (!confirm(`${symbol}을 현재 시세로 1주 PAPER 테스트 매수할까요? 실제 주문은 발생하지 않습니다.`)) return;
+  button.disabled = true;
+  button.textContent = "테스트 주문 중…";
+  try {
+    await request(`${API}/paper/test-buy/${encodeURIComponent(symbol)}`, { method: "POST" });
+    toast(`${symbol} 1주 PAPER 테스트 매수 완료`);
+    await loadAll(true);
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+    button.textContent = "1주 PAPER 테스트 매수";
+  }
+});
+
 $("#startButton").addEventListener("click", async () => {
   $("#startButton").disabled = true;
   await action(`${API}/engine/start`, "추천 예산으로 가상 자동매매를 시작했습니다.");
@@ -373,7 +427,7 @@ $("#recommendationButton").addEventListener("click", async () => {
   $("#recommendationBudget").textContent = "분석 중";
   $("#recommendationList").innerHTML = '<p class="recommendation-loading">토스 시세와 기술적 지표를 분석하고 있습니다...</p>';
   $("#recommendationDisclaimer").textContent = "";
-  $("#recommendationFunnel").textContent = "전체 종목 → 예산·유동성 30개 → 위험 제외 12개 → 지표 분석 중";
+  $("#recommendationFunnel").textContent = "등록 테마 종목 → 시가총액 기준 → 일봉 상승 추세·볼린저 하단 조건 확인 중";
   results.scrollIntoView({ behavior: "smooth", block: "nearest" });
   button.disabled = true;
   button.textContent = "후보 분석 중...";
@@ -382,6 +436,8 @@ $("#recommendationButton").addEventListener("click", async () => {
     renderRecommendations(payload);
   } catch (error) {
     $("#recommendationBudget").textContent = "분석 실패";
+    $("#recommendationFunnel").textContent = `${new Date().toLocaleTimeString("ko-KR")} 조회 실패 · 분석이 완료되지 않았습니다`;
+    $("#recommendationDisclaimer").textContent = "아래 내용은 마지막 조회의 실패 결과입니다. ‘추천 후보 찾기’를 다시 누르면 현재 상태로 재조회합니다. 이 오류는 조건 충족 종목이 없다는 뜻이 아닙니다.";
     $("#recommendationList").innerHTML = `<p class="recommendation-error">${escapeHtml(error.message)}</p>`;
     toast(error.message, true);
   } finally {
@@ -440,4 +496,4 @@ loadAll(true);
 loadWeeklyReport();
 setInterval(loadWeeklyReport, 300000);
 checkTossConnection(false);
-setInterval(() => loadAll(true), 3000);
+setInterval(() => loadAll(true), 30000);

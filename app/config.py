@@ -37,7 +37,7 @@ class Settings:
     app_name: str = "Paper Trader"
     version: str = "0.2.0"
     mode: str = "paper"
-    database_path: Path = Path("data/paper_trader.db")
+    database_path: Path = Path("data/auto_trader.db")
     initial_cash_krw: Decimal = Decimal("10000000")
     initial_cash_usd: Decimal = Decimal("10000")
     fee_rate: Decimal = Decimal("0.00015")
@@ -64,7 +64,7 @@ class Settings:
             raise RuntimeError("RECOMMENDED_TRADE_RATIO는 0부터 1 사이여야 합니다.")
         return cls(
             mode=mode,
-            database_path=Path(os.getenv("DATABASE_PATH", "data/paper_trader.db")),
+            database_path=Path(os.getenv("DATABASE_PATH", "data/auto_trader.db")),
             initial_cash_krw=Decimal(os.getenv("INITIAL_CASH_KRW", "10000000")),
             initial_cash_usd=Decimal(os.getenv("INITIAL_CASH_USD", "10000")),
             fee_rate=Decimal(os.getenv("FEE_RATE", "0.00015")),

@@ -20,7 +20,7 @@ from app.models import Currency, Quote, ThresholdStrategy, serialize, utc_now
 from app.paper import PaperBroker
 from app.repository import SnapshotRepository
 from app.recommendation_service import build_recommendations
-from app.morning_trader import MorningTrader
+from app.swing_trader import SwingTrader
 from app.toss import TossMarketClient
 from app.weekly_report import WeeklyReportService
 
@@ -86,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.broker = broker
         app.state.engine = engine
         app.state.weekly_report = WeeklyReportService()
-        engine.automation = MorningTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
+        engine.automation = SwingTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
         await engine.automation.restore()
         if selected_settings.auto_start:
             await engine.start()
@@ -185,6 +185,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def performance(request: Request) -> dict:
         engine = get_engine(request)
         return engine.broker.performance(engine.quotes)
+
+    @app.post("/api/v1/paper/positions/{symbol}/close")
+    async def close_position(symbol: str, request: Request) -> dict:
+        engine = get_engine(request)
+        try:
+            orders = await engine.automation.manual_close(symbol.strip().upper())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Manual close failed: %s", exc)
+            raise HTTPException(status_code=502, detail="매도를 완료하지 못했습니다. 보유 수량과 시세 연결을 확인하세요.") from exc
+        return {"orders": serialize(orders), "message": "수동 전량 매도 완료"}
 
     @app.get("/api/v1/risk/status")
     async def risk_status(request: Request) -> dict:
@@ -297,7 +309,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = get_engine(request)
         if not engine.toss_client:
             raise HTTPException(status_code=409, detail="추천 후보 탐색은 토스 API 연결이 필요합니다.")
-        return await build_recommendations(engine, request.app.state.weekly_report.cached_direction())
+        result = await build_recommendations(engine, request.app.state.weekly_report.cached_direction())
+        if getattr(engine.automation, 'strategy', None) == 'swing-v1':
+            await engine.automation.store_observations(result, 'manual')
+        return result
+
+    @app.get("/api/v1/swing/signal-history")
+    async def signal_history(request: Request, limit: int = Query(default=100, ge=1, le=1000)) -> dict:
+        engine = get_engine(request)
+        rows = await engine.repository.recent_signal_observations(limit)
+        return {"count": await engine.repository.signal_observation_count(), "observations": rows}
+
+    @app.post("/api/v1/paper/test-buy/{symbol}")
+    async def test_buy(symbol: str, request: Request) -> dict:
+        engine = get_engine(request)
+        try:
+            order = await engine.automation.test_buy(symbol.strip().upper())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).warning("PAPER test buy failed: %s", exc)
+            raise HTTPException(status_code=502, detail="PAPER 테스트 매수를 완료하지 못했습니다.") from exc
+        return {"order": serialize(order), "message": "PAPER 테스트 1주 매수 완료"}
 
     @app.get("/api/v1/market/candles")
     async def market_candles(

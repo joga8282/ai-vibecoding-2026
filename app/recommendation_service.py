@@ -6,9 +6,19 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from fastapi import HTTPException
 from app.recommendations import analyze_candidate
+from app.swing_recommendations import build_swing_recommendations
 
 
 async def build_recommendations(engine, report_direction="neutral") -> dict:
+    if getattr(engine.automation, 'strategy', None) == 'swing-v1':
+        try:
+            result = await build_swing_recommendations(engine)
+        except Exception as exc:
+            engine.last_error = f"recommendations: {type(exc).__name__}: {exc}"
+            raise HTTPException(status_code=502, detail="스윙 후보 조회 실패: 시세 API 연결과 설정을 확인하세요.") from exc
+        if engine.last_error and engine.last_error.startswith('recommendations:'):
+            engine.last_error = None
+        return result
     if getattr(engine.automation, 'strategy', None) == 'morning-v1':
         return await build_morning_recommendations(engine)
     account = engine.broker.account(engine.quotes)
