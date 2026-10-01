@@ -5,11 +5,14 @@ const state = {
   status: null,
   account: null,
   performance: null,
+  risk: null,
   reportPeriod: "daily",
   reportLookup: {},
 };
 let toastTimer;
 const closingPositions = new Set();
+let positionQuoteRefreshAt = 0;
+let positionQuoteRefreshPromise = null;
 
 function applyTheme(theme) {
   const selected = theme === "light" ? "light" : "dark";
@@ -103,7 +106,7 @@ function renderStatus(status, risk) {
   renderDiagnostics(auto?.diagnostics);
   $("#autoBudgetStatus").textContent = auto && Number(auto.budget) > 0
     ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 원가 ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
-    : "대형주·등록 장기 테마 · 일봉 하단 매수 / 상단 매도 · 여러 날 보유";
+    : "최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 또는 터치 후 -2% 매도";
   const weekly = auto?.weekly;
   $("#scalpSummary").textContent = weekly ? `누적 실현손익 ${money(weekly.realized_profit, "KRW")} · 청산 매수원가 대비 ${weekly.return_percent ?? "-"}% · 보유 중 제외` : "기록 대기";
   $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)} · ${escapeHtml(day.name || day.symbol || "")}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
@@ -121,6 +124,7 @@ function renderStatus(status, risk) {
     : "토스 API 키가 설정되지 않았습니다. 시세 연동을 위해 .env 설정을 확인하세요.";
   $("#tossRefreshButton").disabled = status.market_data !== "toss";
   const isPaper = status.mode === "paper";
+  $("#investmentSettingsButton").disabled = !isPaper;
   $("#tradingModeButton").textContent = isPaper ? "PAPER" : "실계좌 주문";
   $("#tradingModeButton").className = `button status-button ${isPaper ? "status-paper" : "status-live"}`;
   if (status.market_data !== "toss") setTossConnection(false);
@@ -158,13 +162,13 @@ function renderAccount(account, performance) {
   state.performance = performance;
   $("#krwCash").textContent = money(account.cash.KRW, "KRW");
   $("#usdCash").textContent = money(account.cash.USD, "USD");
-  $("#krwEquity").textContent = money(account.total_equity.KRW, "KRW");
-  $("#usdEquity").textContent = money(account.total_equity.USD, "USD");
+  $("#krwEquity").textContent = money(performance.by_currency.KRW.current_equity, "KRW");
+  $("#usdEquity").textContent = money(performance.by_currency.USD.current_equity, "USD");
   for (const currency of ["KRW", "USD"]) {
     const target = $(`#${currency.toLowerCase()}Return`);
     const row = performance.by_currency[currency];
     const rate = Number(row.return_rate_percent);
-    target.textContent = `${rate >= 0 ? "+" : ""}${rate.toFixed(2)}% · 손익 ${money(row.profit_loss, currency)}`;
+    target.textContent = `${rate >= 0 ? "+" : ""}${rate.toFixed(2)}% · 누적손익(실현+평가) ${money(row.profit_loss, currency)}`;
     target.className = `metric-change ${rate > 0 ? "positive" : rate < 0 ? "negative" : ""}`;
   }
   $("#filledOrders").textContent = performance.orders.filled;
@@ -172,14 +176,16 @@ function renderAccount(account, performance) {
   renderPositions(account.positions);
 }
 
-function renderCapital(account, risk, status) {
+function renderCapital(account, risk, status, performance) {
   const isPaper = status.mode === "paper";
-  const accountAmount = Number(account.total_equity.KRW || 0);
+  const accountAmount = Number(performance.by_currency.KRW.current_equity || account.total_equity.KRW || 0);
   const availableCash = Number(account.cash.KRW || 0);
-  const tradeRatio = Number(risk.recommended_trade_ratio ?? 0.5);
+  const tradeRatio = Number(risk.recommended_trade_ratio ?? 0.1);
   const hasSession = Number(status.automation?.budget) > 0;
   const recommendationAmount = hasSession ? Number(status.automation.remaining) : Math.min(availableCash, accountAmount * tradeRatio);
   const ratioPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(tradeRatio * 100);
+  $("#investmentRatioInput").value = String(Math.round(tradeRatio * 100));
+  $("#investmentRatioValue").textContent = `${ratioPercent}%`;
   $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
   $("#capitalMode").textContent = isPaper ? "PAPER" : "REAL";
@@ -189,6 +195,7 @@ function renderCapital(account, risk, status) {
   $("#capitalRecommendationHelp").textContent = hasSession
     ? `평가금액의 ${ratioPercent}% 한도에서 보유 원가를 제외한 예산 · 최대 5종목 · 매도 후 재사용`
     : `평가금액의 ${ratioPercent}%를 스윙 예산으로 사용 · 최대 5종목 · 종목별 주문 한도 적용`;
+  $("#capitalRecommendationHelp").textContent = `총평가금액의 ${ratioPercent}%를 1회 매수 목표로 사용 · 분할매수 없음 · 최대 5종목`;
 }
 
 function renderRecommendations(payload) {
@@ -199,13 +206,13 @@ function renderRecommendations(payload) {
   const funnel = payload.funnel || {};
   $("#recommendationFunnel").textContent = `${new Date().toLocaleTimeString("ko-KR")} 조회 완료 · 등록 테마 ${number(funnel.universe || 0, "KRW")}개 → 시세 확인 ${number(funnel.budget_liquidity || 0, "KRW")}개 → 대형주 필터 ${number(funnel.risk_filtered || 0, "KRW")}개 → 지표 분석 ${number(funnel.analyzed || 0, "KRW")}개 → 조건 충족 ${number(funnel.qualified ?? payload.candidates.length, "KRW")}개`;
   $("#recommendationList").innerHTML = payload.candidates.length
-    ? `<h3 class="result-heading">자동 매수 조건 통과</h3>` + payload.candidates.map((item, index) => `<article class="recommendation-card">
+    ? `<h3 class="result-heading">자동 매수 조건 통과</h3>` + payload.candidates.map((item, index) => `<article class="recommendation-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
         <div class="recommendation-rank">#${index + 1} · <strong>${item.score}점</strong></div>
         <h3 title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h3>
         <span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
         <div class="recommendation-metrics">
-          ${item.strategy === "swing-v1" ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>일봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 매수 기준</div><div>일봉 볼린저 상단 ${number(item.bollinger_upper, item.currency)} · 매도 기준</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)} · 상승 추세</div><div>완료 일봉 BB(20,2) · 다일 보유</div>` : `
+          ${String(item.strategy || "").startsWith("swing-v") ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>4시간봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 3% 이내 매수 구간</div><div>손절 평균 매입가 -3% · 4시간봉 상단 또는 터치 후 최고가 -2% 매도</div><div>주봉 MA10 ${number(item.weekly_ma10, item.currency)} · 일봉 MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>주봉·일봉 방향 확인 · 최대 5종목 · 다일 보유</div>` : `
           <div>시가총액 ${marketCap(item.market_cap)}</div>
           <div>일봉 지지 ${number(item.daily_support, item.currency)} · 저항 ${number(item.daily_resistance, item.currency)}</div>
           <div>주봉 지지 ${number(item.weekly_support, item.currency)} · 저항 ${number(item.weekly_resistance, item.currency)}</div>
@@ -225,7 +232,7 @@ function renderRecommendations(payload) {
     : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
   const watchlist = payload.watchlist || [];
   $("#recommendationWatchlist").innerHTML = watchlist.length
-    ? `<h3 class="result-heading">조건 근접 관찰 후보 <small>자동 매수 안 함</small></h3><div class="recommendation-list">${watchlist.map((item, index) => `<article class="recommendation-card watch-card">
+    ? `<h3 class="result-heading">조건 근접 관찰 후보 <small>자동 매수 안 함</small></h3><div class="recommendation-list">${watchlist.map((item, index) => `<article class="recommendation-card watch-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
         <div class="recommendation-rank">관찰 #${index + 1} · <strong>${item.conditions_passed}/${item.conditions_total} 조건 통과</strong></div>
         <h3>${escapeHtml(item.name)}</h3><span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
@@ -235,6 +242,147 @@ function renderRecommendations(payload) {
       </article>`).join("")}</div>`
     : "";
   container.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+const chartState = { symbol: null, name: null, interval: "1d" };
+const chartLabels = { "1d": "일봉", "1w": "주봉", "1M": "월봉", "15m": "15분봉", "30m": "30분봉", "60m": "60분봉", "4h": "4시간봉" };
+
+function renderCandlestickChart(candles, interval, dailyCandles = []) {
+  const canvas = $("#candidateChartCanvas");
+  if (!candles.length) {
+    canvas.innerHTML = '<p class="empty">표시할 시세 데이터가 없습니다.</p>';
+    return;
+  }
+  const rows = candles.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const daily = dailyCandles.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const periods = [20, 60, 120, 240];
+  const maColors = { 20: "#f7c948", 60: "#ff8c42", 120: "#b779ff", 240: "#25c2a0" };
+  const dailyAverages = new Map();
+  const closes = daily.map(candle => Number(candle.close_price));
+  daily.forEach((candle, index) => {
+    const values = {};
+    periods.forEach(period => {
+      if (index + 1 >= period) {
+        const sum = closes.slice(index + 1 - period, index + 1).reduce((total, value) => total + value, 0);
+        values[period] = sum / period;
+      }
+    });
+    if (index + 1 >= 20) {
+      const window = closes.slice(index + 1 - 20, index + 1);
+      const middle = window.reduce((total, value) => total + value, 0) / 20;
+      const deviation = Math.sqrt(window.reduce((total, value) => total + (value - middle) ** 2, 0) / 20);
+      values.bollingerUpper = middle + deviation * 2;
+      values.bollingerLower = middle - deviation * 2;
+    }
+    dailyAverages.set(new Date(candle.timestamp).toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" }), values);
+  });
+  const averagesFor = candle => dailyAverages.get(new Date(candle.timestamp).toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" })) || {};
+  const width = 960, height = 470, left = 18, right = 78, top = 42, priceBottom = 326, volumeTop = 350, volumeBottom = 430, bottom = 30;
+  const plotWidth = width - left - right, plotHeight = priceBottom - top;
+  const highs = rows.map(c => Number(c.high_price));
+  const lows = rows.map(c => Number(c.low_price));
+  const averageValues = rows.flatMap(candle => Object.values(averagesFor(candle)));
+  let maximum = Math.max(...highs, ...averageValues), minimum = Math.min(...lows, ...averageValues);
+  const padding = Math.max((maximum - minimum) * .08, maximum * .002, 1);
+  maximum += padding; minimum -= padding;
+  const y = value => top + (maximum - value) / (maximum - minimum) * plotHeight;
+  const step = plotWidth / rows.length;
+  const bodyWidth = Math.max(2, Math.min(10, step * .62));
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const value = maximum - (maximum - minimum) * index / 4;
+    const py = y(value);
+    return `<line x1="${left}" y1="${py}" x2="${width-right}" y2="${py}" class="chart-grid"/><text x="${width-right+9}" y="${py+4}" class="chart-axis">${new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 }).format(value)}</text>`;
+  }).join("");
+  const bodies = rows.map((candle, index) => {
+    const open = Number(candle.open_price), close = Number(candle.close_price);
+    const high = Number(candle.high_price), low = Number(candle.low_price);
+    const x = left + step * index + step / 2;
+    const rising = close >= open;
+    const bodyTop = y(Math.max(open, close));
+    const bodyHeight = Math.max(1.5, Math.abs(y(open) - y(close)));
+    const cls = rising ? "candle-up" : "candle-down";
+    const previousClose = index > 0 ? Number(rows[index - 1].close_price) : null;
+    const candleChange = open ? (close / open - 1) * 100 : 0;
+    const formatChange = value => `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+    const priceWithChange = value => `${number(value, "KRW")} ${previousClose ? formatChange((value / previousClose - 1) * 100) : "(-)"}`;
+    const volume = number(candle.volume || 0, "KRW");
+    const indicators = averagesFor(candle);
+    const averageDetails = periods.filter(period => indicators[period] != null)
+      .map(period => `MA${period} ${number(indicators[period], "KRW")}`).join(" · ");
+    const bandDetails = indicators.bollingerUpper == null ? "볼린저밴드 데이터 없음"
+      : `볼린저 상단 ${number(indicators.bollingerUpper, "KRW")} · 하단 ${number(indicators.bollingerLower, "KRW")}`;
+    const title = `${new Date(candle.timestamp).toLocaleString("ko-KR")}\n시가 ${priceWithChange(open)}\n고가 ${priceWithChange(high)}\n저가 ${priceWithChange(low)}\n종가 ${priceWithChange(close)} · 시가 대비 ${formatChange(candleChange)}\n거래량 ${volume}\n${averageDetails || "이동평균 데이터 부족"}\n${bandDetails}`;
+    return `<g class="${cls}"><title>${escapeHtml(title)}</title><line x1="${x}" y1="${y(high)}" x2="${x}" y2="${y(low)}"/><rect x="${x-bodyWidth/2}" y="${bodyTop}" width="${bodyWidth}" height="${bodyHeight}" rx="1"/></g>`;
+  }).join("");
+  const maxVolume = Math.max(...rows.map(candle => Number(candle.volume || 0)), 1);
+  const volumeBars = rows.map((candle, index) => {
+    const open = Number(candle.open_price), close = Number(candle.close_price), volume = Number(candle.volume || 0);
+    const x = left + step * index + step / 2;
+    const barHeight = Math.max(1, volume / maxVolume * (volumeBottom - volumeTop));
+    const cls = close >= open ? "volume-up" : "volume-down";
+    return `<rect class="${cls}" x="${x-bodyWidth/2}" y="${volumeBottom-barHeight}" width="${bodyWidth}" height="${barHeight}"><title>거래량 ${number(volume, "KRW")}</title></rect>`;
+  }).join("");
+  const averageLines = periods.map(period => {
+    const points = rows.map((candle, index) => {
+      const value = averagesFor(candle)[period];
+      return value == null ? null : `${left + step * index + step / 2},${y(value)}`;
+    }).filter(Boolean).join(" ");
+    return points ? `<polyline class="moving-average" style="stroke:${maColors[period]}" points="${points}"/>` : "";
+  }).join("");
+  const bandLines = [
+    ["bollingerUpper", "#4d65ff"],
+    ["bollingerLower", "#f2c500"],
+  ].map(([key, color]) => {
+    const points = rows.map((candle, index) => {
+      const value = averagesFor(candle)[key];
+      return value == null ? null : `${left + step * index + step / 2},${y(value)}`;
+    }).filter(Boolean).join(" ");
+    return points ? `<polyline class="moving-average" style="stroke:${color};stroke-width:2.4" points="${points}"/>` : "";
+  }).join("");
+  const legend = [...periods.map(period => ({ label: `MA${period}`, color: maColors[period] })), { label: "BB 상단", color: "#4d65ff" }, { label: "BB 하단", color: "#f2c500" }]
+    .map((item, index) => `<g transform="translate(${left + index * 105},18)"><line x1="0" y1="0" x2="18" y2="0" style="stroke:${item.color};stroke-width:2"/><text x="24" y="4" class="chart-legend">${item.label}</text></g>`).join("");
+  const labelIndexes = [...new Set([0, Math.floor((rows.length-1)/2), rows.length-1])];
+  const dateLabels = labelIndexes.map(index => {
+    const x = left + step * index + step / 2;
+    const date = new Date(rows[index].timestamp);
+    const label = interval.endsWith("m") || interval === "4h"
+      ? date.toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+      : date.toLocaleDateString("ko-KR", { year: "2-digit", month: "2-digit", day: "2-digit" });
+    return `<text x="${x}" y="${height-8}" text-anchor="${index === 0 ? "start" : index === rows.length-1 ? "end" : "middle"}" class="chart-axis">${escapeHtml(label)}</text>`;
+  }).join("");
+  const first = Number(rows[0].open_price), last = Number(rows.at(-1).close_price);
+  const change = first ? (last / first - 1) * 100 : 0;
+  const candleCountLabel = interval === "4h" ? `${rows.length}개 확보 / 최대 50개 요청` : `${rows.length}개`;
+  $("#candidateChartMeta").textContent = `${chartLabels[interval]} · ${candleCountLabel} · 구간 ${change >= 0 ? "+" : ""}${change.toFixed(2)}% · 캔들에 마우스를 올리면 OHLC 확인`;
+  canvas.innerHTML = `<svg class="price-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(chartState.name)} ${chartLabels[interval]} 캔들·거래량·이동평균·볼린저밴드 차트">${legend}${grid}${bandLines}${averageLines}${bodies}<line x1="${left}" y1="${volumeTop-10}" x2="${width-right}" y2="${volumeTop-10}" class="chart-grid"/><text x="${left}" y="${volumeTop-15}" class="chart-axis">거래량</text>${volumeBars}${dateLabels}</svg>`;
+}
+
+async function loadCandidateChart(symbol, name, interval = "1d") {
+  chartState.symbol = symbol; chartState.name = name; chartState.interval = interval;
+  const panel = $("#candidateChartPanel");
+  panel.hidden = false;
+  $("#candidateChartTitle").textContent = `${name} (${symbol})`;
+  $("#candidateChartMeta").textContent = `${chartLabels[interval]} 불러오는 중`;
+  $("#candidateChartCanvas").innerHTML = '<p class="recommendation-loading">시세 데이터를 불러오고 있습니다...</p>';
+  document.querySelectorAll("[data-chart-interval]").forEach(button => button.classList.toggle("active", button.dataset.chartInterval === interval));
+  const minute = ["15m", "30m", "60m", "4h"].includes(interval);
+  $("#minutePeriods").hidden = !minute;
+  document.querySelector("[data-chart-minute-toggle]").classList.toggle("active", minute);
+  const count = interval === "4h" ? 50 : interval === "1M" ? 36 : interval === "1w" ? 52 : 60;
+  try {
+    const chartRequest = request(`${API}/market/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&count=${count}`);
+    const dailyRequest = request(`${API}/market/candles?symbol=${encodeURIComponent(symbol)}&interval=1d&count=300`);
+    const [payload, dailyPayload] = await Promise.all([chartRequest, dailyRequest]);
+    if (chartState.symbol === symbol && chartState.interval === interval) renderCandlestickChart(payload.candles || [], interval, dailyPayload.candles || []);
+  } catch (error) {
+    $("#candidateChartCanvas").innerHTML = `<p class="recommendation-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function openChartFromCard(card) {
+  if (!card) return;
+  loadCandidateChart(card.dataset.chartSymbol, card.dataset.chartName, "1d");
+  requestAnimationFrame(() => $("#candidateChartPanel").scrollIntoView({ behavior: "smooth", block: "nearest" }));
 }
 
 const REPORT_FAVORITES_KEY = "paper-trader-report-favorites";
@@ -307,14 +455,19 @@ function renderPositions(positions) {
   $("#positionCount").textContent = positions.length;
   $("#positionsEmpty").hidden = positions.length > 0;
   $("#positionsTable").innerHTML = positions.map((position) => {
-    const pnl = Number(position.unrealized_profit_loss);
+    const hasQuote = Boolean(position.quote_timestamp);
+    const pnl = hasQuote ? Number(position.unrealized_profit_loss) : null;
+    const cost = Number(position.average_price) * Number(position.quantity);
+    const pnlRate = hasQuote && cost ? pnl / cost * 100 : null;
     return `<tr>
       <td>${stockLabel(position)}<br><span class="muted">${position.currency}</span></td>
       <td>${number(position.quantity, position.currency)}</td>
       <td>${number(position.average_price, position.currency)}</td>
-      <td>${number(position.market_price, position.currency)}</td>
-      <td class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${number(pnl, position.currency)}</td>
-      <td><button type="button" class="button button-danger" data-close-position="${escapeHtml(position.symbol)}" ${closingPositions.has(position.symbol) || position.currency !== "KRW" ? "disabled" : ""} aria-label="${escapeHtml(position.name || position.symbol)} 가상 전량 매도">${closingPositions.has(position.symbol) ? "매도 중…" : "전량 매도"}</button></td>
+      <td>${hasQuote ? number(position.market_price, position.currency) : '<span class="muted">시세 없음</span>'}</td>
+      <td class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${hasQuote
+        ? `${number(pnl, position.currency)}<br><span class="muted">${pnlRate > 0 ? "+" : ""}${pnlRate.toFixed(2)}%</span>`
+        : '<span class="muted">계산 대기</span>'}</td>
+      <td><button type="button" class="button button-danger" data-close-position="${escapeHtml(position.symbol)}" ${closingPositions.has(position.symbol) || position.currency !== "KRW" ? "disabled" : ""} aria-label="${escapeHtml(position.name || position.symbol)} 수동 전량 매도">${closingPositions.has(position.symbol) ? "매도 중…" : "수동 전량매도"}</button></td>
     </tr>`;
   }).join("");
 }
@@ -340,13 +493,26 @@ function renderQuotes(quotes) {
 
 async function loadAll(silent = false) {
   try {
+    const previousStatus = state.status || await request(`${API}/system/status`);
+    const heldCount = state.account?.positions?.length || previousStatus.automation?.holding_count || 0;
+    if (previousStatus.mode === "paper" && previousStatus.market_data === "toss" && heldCount > 0
+        && Date.now() - positionQuoteRefreshAt >= 25000) {
+      if (!positionQuoteRefreshPromise) {
+        positionQuoteRefreshAt = Date.now();
+        positionQuoteRefreshPromise = request(`${API}/market/refresh`, { method: "POST" })
+          .catch(() => { positionQuoteRefreshAt = 0; })
+          .finally(() => { positionQuoteRefreshPromise = null; });
+      }
+      await positionQuoteRefreshPromise;
+    }
     const [status, account, performance, orders, quotes, risk] = await Promise.all([
       request(`${API}/system/status`), request(`${API}/paper/account`), request(`${API}/performance`),
       request(`${API}/orders`), request(`${API}/market/quotes`), request(`${API}/risk/status`),
     ]);
+    state.risk = risk;
     renderStatus(status, risk);
     renderAccount(account, performance);
-    renderCapital(account, risk, status);
+    renderCapital(account, risk, status, performance);
     renderOrders(orders.orders);
     renderQuotes(quotes.quotes);
     if (!silent) toast("최신 상태를 불러왔습니다.");
@@ -363,6 +529,39 @@ async function action(path, message) {
     await loadAll(true);
   } catch (error) { toast(error.message, true); }
 }
+
+const investmentSettingsDialog = $("#investmentSettingsDialog");
+$("#investmentSettingsButton").addEventListener("click", () => {
+  if (state.status?.mode !== "paper") return;
+  const currentPercent = Math.round(Number(state.risk?.recommended_trade_ratio ?? 0.1) * 100);
+  $("#investmentRatioInput").value = String(currentPercent);
+  $("#investmentRatioValue").textContent = `${currentPercent}%`;
+  investmentSettingsDialog.showModal();
+});
+$("#investmentRatioInput").addEventListener("input", event => {
+  $("#investmentRatioValue").textContent = `${event.currentTarget.value}%`;
+});
+$("#investmentSettingsClose").addEventListener("click", () => investmentSettingsDialog.close());
+$("#investmentSettingsCancel").addEventListener("click", () => investmentSettingsDialog.close());
+$("#investmentSettingsForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const saveButton = event.currentTarget.querySelector('button[type="submit"]');
+  saveButton.disabled = true;
+  try {
+    const ratioPercent = Number($("#investmentRatioInput").value);
+    await request(`${API}/settings/investment-ratio`, {
+      method: "PUT",
+      body: JSON.stringify({ ratio_percent: ratioPercent }),
+    });
+    investmentSettingsDialog.close();
+    toast(`1회 매수 비율을 ${ratioPercent}%로 저장했습니다.`);
+    await loadAll(true);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    saveButton.disabled = false;
+  }
+});
 
 $("#positionsTable").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-close-position]");
@@ -402,6 +601,30 @@ $("#recommendationWatchlist").addEventListener("click", async (event) => {
   }
 });
 
+function recommendationChartInteraction(event) {
+  if (event.target.closest("button")) return;
+  const card = event.target.closest("[data-chart-symbol]");
+  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+  if (event.type === "keydown") event.preventDefault();
+  openChartFromCard(card);
+}
+
+for (const selector of ["#recommendationList", "#recommendationWatchlist"]) {
+  $(selector).addEventListener("click", recommendationChartInteraction);
+  $(selector).addEventListener("keydown", recommendationChartInteraction);
+}
+
+document.querySelectorAll("[data-chart-interval]").forEach(button => button.addEventListener("click", () => {
+  if (chartState.symbol) loadCandidateChart(chartState.symbol, chartState.name, button.dataset.chartInterval);
+}));
+
+document.querySelector("[data-chart-minute-toggle]").addEventListener("click", () => {
+  $("#minutePeriods").hidden = false;
+  if (chartState.symbol) loadCandidateChart(chartState.symbol, chartState.name, "15m");
+});
+
+$("#candidateChartClose").addEventListener("click", () => { $("#candidateChartPanel").hidden = true; });
+
 $("#startButton").addEventListener("click", async () => {
   $("#startButton").disabled = true;
   await action(`${API}/engine/start`, "추천 예산으로 가상 자동매매를 시작했습니다.");
@@ -427,7 +650,7 @@ $("#recommendationButton").addEventListener("click", async () => {
   $("#recommendationBudget").textContent = "분석 중";
   $("#recommendationList").innerHTML = '<p class="recommendation-loading">토스 시세와 기술적 지표를 분석하고 있습니다...</p>';
   $("#recommendationDisclaimer").textContent = "";
-  $("#recommendationFunnel").textContent = "등록 테마 종목 → 시가총액 기준 → 일봉 상승 추세·볼린저 하단 조건 확인 중";
+  $("#recommendationFunnel").textContent = "등록 테마 종목 → 시가총액 기준 → 주봉·일봉 추세 → 4시간봉 진입 구간 확인 중";
   results.scrollIntoView({ behavior: "smooth", block: "nearest" });
   button.disabled = true;
   button.textContent = "후보 분석 중...";

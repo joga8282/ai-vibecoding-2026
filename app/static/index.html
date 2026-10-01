@@ -39,19 +39,20 @@
             <p class="eyebrow">거래 엔진</p>
             <h2 id="engineLabel">중지됨</h2>
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
-            <p id="autoBudgetStatus" class="muted">대형주·등록 장기 테마 · 일봉 하단 매수 / 상단 매도 · 여러 날 보유</p>
-            <p class="muted">20분 간격 조정 확인 + 첫 매수가 대비 0.2% 하락마다 추가 매수 · 매도 시 전량 청산</p>
-            <p class="muted">평일 09:00~15:30 · 오후에도 조건 충족 시 매수 · 5분 간격 확인 · 일봉 하단 매수 / 상단 매도 · 시간 청산 없음</p>
-            <p class="muted">매수 후 10분 내 +2% 급등 시 고점 추적 · 고점 대비 -3% 매도</p>
+            <p id="autoBudgetStatus" class="muted">최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 추적 매도</p>
+            <p class="muted">매수 신호 시 총평가금액의 설정 비율로 1회 일괄 매수 · 종목별 분할매수 없음</p>
+            <p class="muted">평일 09:00~15:30 · 5분 간격 확인 · 최대 5종목 · 평균가 -3% 손절 · 4시간봉 상단 또는 터치 후 최고가 -2% 매도</p>
+            <p class="muted">최대 5종목 보유 · 5종목이면 기존 매도 조건으로 자리가 날 때까지 신규 매수 대기</p>
           </div>
           <div class="control-row">
             <button id="startButton" class="button button-primary" type="button">가상 자동매매 시작</button>
             <button id="stopButton" class="button button-secondary" type="button">중지</button>
+            <button id="investmentSettingsButton" class="button button-ghost" type="button">투자비율 설정</button>
           </div>
         </article>
 
         <article class="metric-card">
-          <p class="metric-label">KRW 총자산</p>
+          <p class="metric-label">KRW 총평가금액</p>
           <p id="krwEquity" class="metric-value">-</p>
           <p id="krwReturn" class="metric-change">-</p>
         </article>
@@ -71,6 +72,25 @@
           </div>
         </article>
       </section>
+
+      <dialog id="investmentSettingsDialog" class="investment-dialog" aria-labelledby="investmentSettingsTitle">
+        <form id="investmentSettingsForm">
+          <div class="panel-header">
+            <div><p class="eyebrow">POSITION SIZE</p><h2 id="investmentSettingsTitle">1회 매수 투자비율</h2></div>
+            <button id="investmentSettingsClose" class="text-button" type="button">닫기</button>
+          </div>
+          <label class="investment-ratio-control" for="investmentRatioInput">
+            <span>총평가금액에서 한 번에 매수할 비율</span>
+            <strong id="investmentRatioValue">10%</strong>
+          </label>
+          <input id="investmentRatioInput" type="range" min="1" max="50" step="1" value="10">
+          <p id="investmentRatioHelp" class="muted">기본 10%. 매수 신호가 오면 이 비율만큼 한 번에 주문합니다. 종목별 분할매수는 하지 않으며, 최대 5종목까지 보유합니다. 보유 종목이 5개면 기존 매도 조건으로 자리가 날 때까지 신규 매수는 대기합니다.</p>
+          <div class="control-row investment-dialog-actions">
+            <button id="investmentSettingsCancel" class="button button-secondary" type="button">취소</button>
+            <button class="button button-primary" type="submit">저장</button>
+          </div>
+        </form>
+      </dialog>
 
       <section class="capital-bridge" aria-label="주문 자금 요약">
         <article class="panel capital-panel">
@@ -104,10 +124,10 @@
           <div class="strategy-grid">
             <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small>국내 보통주 · 시가총액 1조 원 이상</small></div>
             <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
-            <div><span>매수</span><strong>BB(20,2) 하단 이하</strong><small>세 조건을 모두 충족해야 자동 매수</small></div>
-            <div><span>매도</span><strong>BB(20,2) 상단 이상</strong><small>또는 보유 종목의 전량 매도 버튼</small></div>
+            <div><span>매수</span><strong>4시간봉 BB(6,2) 하단 3% 이내</strong><small>주봉·일봉 상승 방향을 먼저 확인</small></div>
+            <div><span>매도</span><strong>4시간봉 상단 또는 터치 후 -2%</strong><small>평균 매입가 -3% 손절 · 수동 전량매도 가능</small></div>
             <div><span>운영시간</span><strong>평일 09:00~15:30</strong><small>오전·오후 5분 간격 검색</small></div>
-            <div><span>자금관리</span><strong>최대 5종목</strong><small>평가금액의 50% 한도 · PAPER 전용</small></div>
+            <div><span>자금관리</span><strong>최대 5종목</strong><small>1회 매수 비율 설정 · PAPER 전용</small></div>
             <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>
           </div>
           <p class="muted">검색 결과에서 자동 매수 조건 통과 종목과 조건에 가까운 관찰 후보를 구분합니다. 관찰 후보는 자동 매수되지 않습니다.</p>
@@ -123,6 +143,25 @@
           <p id="recommendationFunnel" class="recommendation-funnel">전체 종목 → 예산·유동성 → 위험 제외 → 지표 분석</p>
           <div id="recommendationList" class="recommendation-list" aria-live="polite"></div>
           <div id="recommendationWatchlist" class="recommendation-watchlist"></div>
+          <article id="candidateChartPanel" class="candidate-chart panel" hidden>
+            <div class="chart-heading">
+              <div><p class="eyebrow">PRICE CHART</p><h2 id="candidateChartTitle">종목 차트</h2><p id="candidateChartMeta" class="muted"></p></div>
+              <button id="candidateChartClose" class="text-button" type="button">닫기</button>
+            </div>
+            <div class="chart-periods" role="group" aria-label="차트 주기">
+              <button class="chart-period active" type="button" data-chart-interval="1d">일봉</button>
+              <button class="chart-period" type="button" data-chart-interval="1w">주봉</button>
+              <button class="chart-period" type="button" data-chart-interval="1M">월봉</button>
+              <button class="chart-period" type="button" data-chart-minute-toggle>분봉</button>
+            </div>
+            <div id="minutePeriods" class="minute-periods" hidden>
+              <button class="chart-period" type="button" data-chart-interval="15m">15분</button>
+              <button class="chart-period" type="button" data-chart-interval="30m">30분</button>
+              <button class="chart-period" type="button" data-chart-interval="60m">60분</button>
+              <button class="chart-period" type="button" data-chart-interval="4h">4시간</button>
+            </div>
+            <div id="candidateChartCanvas" class="chart-canvas" aria-live="polite"><p class="empty">추천 종목을 클릭하면 차트를 표시합니다.</p></div>
+          </article>
           <p id="recommendationDisclaimer" class="recommendation-disclaimer"></p>
         </div>
       </section>
@@ -162,14 +201,14 @@
                     <th>평균가</th>
                     <th>현재가</th>
                     <th>평가손익</th>
-                    <th>청산</th>
+                    <th>수동 주문</th>
                   </tr>
                 </thead>
                 <tbody id="positionsTable"></tbody>
               </table>
             </div>
             <p id="positionsEmpty" class="empty">아직 보유한 종목이 없습니다.</p>
-            <p class="muted">전량 매도: 목표가와 관계없이 현재 시세로 가상 청산합니다. 국내 종목 · 평일 09:00~15:30 · 당일 자동 재매수 제외</p>
+            <p class="muted">수동 전량매도 버튼을 직접 눌렀을 때만 목표가와 관계없이 현재 시세로 가상 청산합니다. 국내 종목 · 평일 09:00~15:30 · 당일 자동 재매수 제외</p>
           </article>
 
           <article class="panel">

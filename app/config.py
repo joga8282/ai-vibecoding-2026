@@ -44,27 +44,48 @@ class Settings:
     slippage_bps: Decimal = Decimal("5")
     max_order_amount_krw: Decimal = Decimal("1000000")
     max_order_amount_usd: Decimal = Decimal("1000")
-    recommended_trade_ratio: Decimal = Decimal("0.50")
+    recommended_trade_ratio: Decimal = Decimal("0.10")
     engine_interval_seconds: float = 2.0
     auto_start: bool = False
     toss_market_data_enabled: bool = True
     toss_client_id: str | None = None
     toss_client_secret: str | None = None
+    toss_account_seq: str | None = None
+    live_trading_enabled: bool = False
+    live_require_manual_arm: bool = True
+    live_max_order_amount_krw: Decimal = Decimal("100000")
+    live_max_total_exposure_krw: Decimal = Decimal("500000")
+    live_max_daily_loss_krw: Decimal = Decimal("50000")
+    live_max_position_loss_percent: Decimal = Decimal("3")
+    live_allowed_symbols: tuple[str, ...] = ()
+    api_access_token: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
         mode = os.getenv("TRADER_MODE", "paper").strip().lower()
-        if mode != "paper":
-            raise RuntimeError("현재 버전은 paper 모드만 지원합니다.")
+        if mode not in {"paper", "live"}:
+            raise RuntimeError("TRADER_MODE는 paper 또는 live여야 합니다.")
         recommended_trade_ratio = Decimal(
-            os.getenv("RECOMMENDED_TRADE_RATIO", "0.50")
+            os.getenv("RECOMMENDED_TRADE_RATIO", "0.10")
         )
         if not Decimal("0") <= recommended_trade_ratio <= Decimal("1"):
             raise RuntimeError("RECOMMENDED_TRADE_RATIO는 0부터 1 사이여야 합니다.")
+        database_path = Path(os.getenv(
+            "LIVE_DATABASE_PATH" if mode == "live" else "DATABASE_PATH",
+            "data/live_trader.db" if mode == "live" else "data/auto_trader.db",
+        ))
+        account_seq = os.getenv("TOSS_ACCOUNT_SEQ") or None
+        live_enabled = _as_bool(os.getenv("LIVE_TRADING_ENABLED"))
+        if mode == 'live' and not account_seq:
+            raise RuntimeError("LIVE 읽기 전용 모드에는 TOSS_ACCOUNT_SEQ가 필요합니다.")
+        if mode == 'live' and database_path == Path(os.getenv("DATABASE_PATH", "data/auto_trader.db")):
+            raise RuntimeError("LIVE_DATABASE_PATH는 PAPER DB와 달라야 합니다.")
+        if live_enabled:
+            raise RuntimeError("LIVE 주문 전송은 아직 잠겨 있습니다. LIVE_TRADING_ENABLED=false를 사용하세요.")
         return cls(
             mode=mode,
-            database_path=Path(os.getenv("DATABASE_PATH", "data/auto_trader.db")),
+            database_path=database_path,
             initial_cash_krw=Decimal(os.getenv("INITIAL_CASH_KRW", "10000000")),
             initial_cash_usd=Decimal(os.getenv("INITIAL_CASH_USD", "10000")),
             fee_rate=Decimal(os.getenv("FEE_RATE", "0.00015")),
@@ -79,4 +100,13 @@ class Settings:
             ),
             toss_client_id=os.getenv("TOSS_CLIENT_ID") or None,
             toss_client_secret=os.getenv("TOSS_CLIENT_SECRET") or None,
+            toss_account_seq=account_seq,
+            live_trading_enabled=live_enabled,
+            live_require_manual_arm=_as_bool(os.getenv("LIVE_REQUIRE_MANUAL_ARM"), default=True),
+            live_max_order_amount_krw=Decimal(os.getenv("LIVE_MAX_ORDER_AMOUNT_KRW", "100000")),
+            live_max_total_exposure_krw=Decimal(os.getenv("LIVE_MAX_TOTAL_EXPOSURE_KRW", "500000")),
+            live_max_daily_loss_krw=Decimal(os.getenv("LIVE_MAX_DAILY_LOSS_KRW", "50000")),
+            live_max_position_loss_percent=Decimal(os.getenv("LIVE_MAX_POSITION_LOSS_PERCENT", "3")),
+            live_allowed_symbols=tuple(filter(None, (s.strip().upper() for s in os.getenv("LIVE_ALLOWED_SYMBOLS", "").split(',')))),
+            api_access_token=os.getenv("API_ACCESS_TOKEN") or None,
         )

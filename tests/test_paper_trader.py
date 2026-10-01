@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -76,6 +78,15 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
         performance = restored.performance({"005930": sell_quote})
         self.assertEqual(performance["by_currency"]["KRW"]["profit_loss"], "10000")
         self.assertEqual(performance["orders"]["filled"], 2)
+        with closing(sqlite3.connect(self.database_path)) as connection:
+            rows = connection.execute(
+                "SELECT symbol, side, status FROM trade_orders ORDER BY created_at"
+            ).fetchall()
+            positions = connection.execute(
+                "SELECT symbol, purchase_amount FROM portfolio_positions"
+            ).fetchall()
+        self.assertEqual(rows, [("005930", "BUY", "FILLED"), ("005930", "SELL", "FILLED")])
+        self.assertEqual(positions, [])
 
     async def test_stock_names_are_cached_without_mutating_orders(self) -> None:
         self.engine.toss_client = Mock(stocks_info=AsyncMock(return_value=[
@@ -153,7 +164,7 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
             )
             for index in range(120)
         ]
-        expected_counts = {"5m": 24, "15m": 8, "50m": 4, "60m": 2}
+        expected_counts = {"5m": 24, "15m": 8, "30m": 4, "50m": 4, "60m": 2}
         for interval, expected in expected_counts.items():
             with self.subTest(interval=interval):
                 aggregated = self.engine._aggregate_candles(source, interval)
@@ -186,6 +197,32 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(self.engine._aggregate_candles(source, "1w")), 3)
         self.assertEqual(len(self.engine._aggregate_candles(source, "1M")), 3)
+
+    async def test_four_hour_candles_follow_korean_market_sessions(self) -> None:
+        timestamps = [
+            datetime(2026, 9, 23, 0, 0, tzinfo=timezone.utc),   # 09:00 KST
+            datetime(2026, 9, 23, 3, 59, tzinfo=timezone.utc),  # 12:59 KST
+            datetime(2026, 9, 23, 4, 0, tzinfo=timezone.utc),   # 13:00 KST
+            datetime(2026, 9, 23, 6, 30, tzinfo=timezone.utc),  # 15:30 KST
+            datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc),
+        ]
+        source = [
+            Candle(
+                timestamp=value,
+                open_price=Decimal(index + 1),
+                high_price=Decimal(index + 2),
+                low_price=Decimal(index),
+                close_price=Decimal(index + 1),
+                volume=Decimal("10"),
+                currency=Currency.KRW,
+            )
+            for index, value in enumerate(timestamps)
+        ]
+        aggregated = self.engine._aggregate_candles(source, "4h")
+        self.assertEqual(len(aggregated), 3)
+        self.assertEqual(aggregated[0].volume, Decimal("20"))
+        self.assertEqual(aggregated[1].volume, Decimal("20"))
+        self.assertEqual(aggregated[2].volume, Decimal("10"))
 
     async def test_korean_stock_name_search_prefers_exact_match(self) -> None:
         client = TossMarketClient("test", "test")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.config import Settings
 from app.engine import TradingEngine
 from app.models import Currency, Quote, ThresholdStrategy, serialize, utc_now
 from app.paper import PaperBroker
+from app.brokers.toss_real import TossRealBroker
 from app.repository import SnapshotRepository
 from app.recommendation_service import build_recommendations
 from app.swing_trader import SwingTrader
@@ -57,8 +59,21 @@ class PaperResetInput(BaseModel):
     cash_usd: NonNegativeDecimal = Decimal("10000")
 
 
+class InvestmentRatioInput(BaseModel):
+    ratio_percent: Decimal = Field(ge=1, le=50)
+
+
 def get_engine(request: Request) -> TradingEngine:
     return request.app.state.engine
+
+
+def require_live_access(request: Request) -> TossRealBroker:
+    settings = request.app.state.settings
+    if settings.mode != 'live' or not getattr(request.app.state, 'live_broker', None):
+        raise HTTPException(status_code=409, detail='LIVE 읽기 전용 모드가 아닙니다.')
+    if settings.api_access_token and request.headers.get('X-API-Token') != settings.api_access_token:
+        raise HTTPException(status_code=401, detail='LIVE API 인증이 필요합니다.')
+    return request.app.state.live_broker
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -66,10 +81,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal selected_settings
         repository = SnapshotRepository(selected_settings.database_path)
         await repository.initialize()
-        broker = PaperBroker(selected_settings, repository)
-        await broker.restore()
+        trading_preferences = await repository.load("trading_preferences") or {}
+        saved_ratio = trading_preferences.get("recommended_trade_ratio")
+        if saved_ratio is not None:
+            selected_settings = replace(
+                selected_settings,
+                recommended_trade_ratio=Decimal(str(saved_ratio)),
+            )
         toss_client = None
         if (
             selected_settings.toss_market_data_enabled
@@ -79,6 +100,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             toss_client = TossMarketClient(
                 selected_settings.toss_client_id, selected_settings.toss_client_secret
             )
+        if selected_settings.mode == 'live':
+            if not toss_client:
+                raise RuntimeError('LIVE 읽기 전용 모드에는 토스 API 인증정보가 필요합니다.')
+            broker = TossRealBroker(toss_client, selected_settings.toss_account_seq, repository)
+        else:
+            broker = PaperBroker(selected_settings, repository)
+        await broker.restore()
         engine = TradingEngine(selected_settings, broker, repository, toss_client)
         await engine.restore()
         app.state.settings = selected_settings
@@ -86,9 +114,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.broker = broker
         app.state.engine = engine
         app.state.weekly_report = WeeklyReportService()
-        engine.automation = SwingTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
-        await engine.automation.restore()
-        if selected_settings.auto_start:
+        app.state.live_broker = broker if selected_settings.mode == 'live' else None
+        if selected_settings.mode == 'paper':
+            engine.automation = SwingTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
+            await engine.automation.restore()
+        if selected_settings.mode == 'paper' and toss_client and broker.positions:
+            try:
+                stocks = await asyncio.wait_for(toss_client.stocks_info(sorted(broker.positions)), timeout=10)
+                await repository.update_position_names({stock['symbol']: stock.get('name') for stock in stocks})
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Position name lookup failed: %s", exc)
+        if selected_settings.auto_start and selected_settings.mode == 'paper':
             await engine.start()
         yield
         await engine.stop()
@@ -97,8 +133,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=selected_settings.app_name,
         version=selected_settings.version,
         description=(
-            "토스증권 시세를 선택적으로 사용하는 paper-only 자동매매 MVP. "
-            "v0.1에는 실제 주문 기능이 없습니다."
+            "PAPER 자동매매와 토스 실계좌 읽기 전용 동기화를 지원합니다. "
+            "LIVE 주문 전송은 잠겨 있습니다."
         ),
         lifespan=lifespan,
     )
@@ -118,13 +154,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = get_engine(request)
         return {
             "status": "ready",
-            "mode": "paper",
+            "mode": selected_settings.mode,
             "market_data": "toss" if engine.toss_client else "manual",
         }
 
     @app.get("/api/v1/system/status")
     async def system_status(request: Request) -> dict:
         return get_engine(request).status()
+
+    @app.get('/api/v1/live/status')
+    async def live_status(request: Request) -> dict:
+        broker = require_live_access(request)
+        return {'mode': 'live-readonly', 'orders_enabled': False, 'reconciled': broker.reconciled,
+                'last_sync_at': broker.last_sync_at.isoformat() if broker.last_sync_at else None,
+                'last_error': broker.last_error}
+
+    @app.post('/api/v1/live/reconcile')
+    async def live_reconcile(request: Request) -> dict:
+        broker = require_live_access(request)
+        try:
+            return await broker.reconcile()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f'실계좌 동기화 실패: {exc}') from exc
+
+    @app.get('/api/v1/live/accounts')
+    async def live_accounts(request: Request) -> dict:
+        return {'accounts': await require_live_access(request).get_accounts()}
+
+    @app.get('/api/v1/live/positions')
+    async def live_positions(request: Request) -> dict:
+        return {'positions': await require_live_access(request).get_positions()}
+
+    @app.get('/api/v1/live/orders')
+    async def live_orders(request: Request, order_status: str | None = None) -> dict:
+        return {'orders': await require_live_access(request).list_orders(order_status)}
 
     @app.get("/api/v1/weekly-report")
     async def weekly_report(
@@ -177,6 +240,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/paper/account")
     async def paper_account(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode != 'paper':
+            raise HTTPException(status_code=409, detail='PAPER 계좌 API는 PAPER 모드에서만 사용할 수 있습니다.')
         account = engine.broker.account(engine.quotes)
         account["positions"] = await engine.with_stock_names(account["positions"])
         return account
@@ -189,6 +254,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/paper/positions/{symbol}/close")
     async def close_position(symbol: str, request: Request) -> dict:
         engine = get_engine(request)
+        if not engine.automation:
+            raise HTTPException(status_code=409, detail='LIVE 읽기 전용 모드에서는 주문할 수 없습니다.')
         try:
             orders = await engine.automation.manual_close(symbol.strip().upper())
         except RuntimeError as exc:
@@ -213,9 +280,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "recommended_trade_ratio": str(settings.recommended_trade_ratio),
         }
 
+    @app.put("/api/v1/settings/investment-ratio")
+    async def update_investment_ratio(payload: InvestmentRatioInput, request: Request) -> dict:
+        if request.app.state.settings.mode != "paper":
+            raise HTTPException(status_code=409, detail="투자비율 설정은 PAPER 모드에서만 변경할 수 있습니다.")
+        ratio = payload.ratio_percent / Decimal("100")
+        settings = replace(request.app.state.settings, recommended_trade_ratio=ratio)
+        await request.app.state.repository.save(
+            "trading_preferences", {"recommended_trade_ratio": str(ratio)}
+        )
+        request.app.state.settings = settings
+        engine = get_engine(request)
+        engine.settings = settings
+        if hasattr(engine.broker, "settings"):
+            engine.broker.settings = settings
+        return {"ratio_percent": str(payload.ratio_percent), "recommended_trade_ratio": str(ratio)}
+
     @app.post("/api/v1/paper/reset")
     async def reset_paper_account(payload: PaperResetInput, request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode != 'paper':
+            raise HTTPException(status_code=409, detail='LIVE 모드에서는 PAPER 계좌를 초기화할 수 없습니다.')
         if engine.running:
             raise HTTPException(status_code=409, detail="엔진을 중지한 뒤 초기화하세요.")
         await engine.broker.reset(payload.cash_krw, payload.cash_usd)
@@ -310,7 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not engine.toss_client:
             raise HTTPException(status_code=409, detail="추천 후보 탐색은 토스 API 연결이 필요합니다.")
         result = await build_recommendations(engine, request.app.state.weekly_report.cached_direction())
-        if getattr(engine.automation, 'strategy', None) == 'swing-v1':
+        if str(getattr(engine.automation, 'strategy', '')).startswith('swing-v'):
             await engine.automation.store_observations(result, 'manual')
         return result
 
@@ -337,7 +422,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         symbol: str = Query(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9.\-]+$"),
         interval: str = Query(
-            default="1d", pattern=r"^(1d|1w|1M)$"
+            default="1d", pattern=r"^(15m|30m|60m|4h|1d|1w|1M)$"
         ),
         count: int = Query(default=250, ge=1, le=300),
     ) -> dict:

@@ -151,7 +151,7 @@ class AutoTraderTest(IsolatedAsyncioTestCase):
             engine._run = AsyncMock()
             result = await routes['/api/v1/engine/start'](request)
             self.assertEqual(result['mode'], 'paper')
-            self.assertEqual(result['automation']['strategy'], 'swing-v1')
+            self.assertEqual(result['automation']['strategy'], 'swing-v2-mtf-4h')
             self.assertEqual(D(result['automation']['budget']), D('500000'))
             result = await routes['/api/v1/engine/stop'](request)
             self.assertFalse(result['running'])

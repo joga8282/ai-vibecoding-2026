@@ -4,7 +4,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.models import Candle, Currency, Side, Quote
-from app.swing_signals import swing_signal, KST
+from app.swing_signals import four_hour_exit_signal, swing_signal, KST
 from app.swing_trader import SwingTrader
 from app.swing_recommendations import build_swing_recommendations
 from app.swing_universe import membership
@@ -32,6 +32,27 @@ class SignalTest(TestCase):
         baseline = swing_signal(self.daily, D(145), self.now)
         today = Candle(self.now, D(1000), D(1000), D(1), D(1000), D(10), Currency.KRW)
         self.assertEqual(baseline, swing_signal(self.daily + [today], D(145), self.now))
+
+    def test_multi_timeframe_entry_uses_four_hour_approach_zone(self):
+        values = [D(150 + i * 2) for i in range(10)] + [D(150), D(148)]
+        four_hour = [Candle((self.now - timedelta(days=6-i//2)).replace(hour=9 if i % 2 == 0 else 13),
+                            value, value, value, value, D(1000), Currency.KRW)
+                     for i, value in enumerate(values)]
+        signal = swing_signal(self.daily, D(145), self.now, four_hour)
+        self.assertTrue(signal['weekly_uptrend'])
+        self.assertTrue(signal['daily_uptrend'])
+        self.assertTrue(signal['eligible'])
+        self.assertEqual(signal['conditions_passed'], 3)
+        self.assertFalse(swing_signal(self.daily, D(160), self.now, four_hour)['eligible'])
+
+    def test_four_hour_upper_touch_is_an_exit_signal(self):
+        values = [D(100), D(101), D(102), D(103), D(104), D(105)]
+        bars = [Candle((self.now - timedelta(days=3-i//2)).replace(hour=9 if i % 2 == 0 else 13),
+                       value, value, value, value, D(1000), Currency.KRW)
+                for i, value in enumerate(values)]
+        baseline = four_hour_exit_signal(bars, D(100), self.now)
+        upper = D(baseline['bollinger_upper'])
+        self.assertTrue(four_hour_exit_signal(bars, upper, self.now)['sell_at_upper'])
 
     def test_rising_twenty_day_average_can_enter_when_sixty_day_average_falls(self):
         # Old high prices roll out of MA60 while recent prices recover above it.
@@ -81,7 +102,12 @@ class SwingTest(IsolatedAsyncioTestCase):
         async def candles(symbol, interval, count):
             if interval == '1d':
                 return self.daily
-            return [Candle(self.now, self.price, self.price, self.price, self.price, D(1000), Currency.KRW)]
+            if count <= 3:
+                return [Candle(self.now, self.price, self.price, self.price, self.price, D(1000), Currency.KRW)]
+            values = [D(150 + i * 2) for i in range(10)] + [D(150), D(148)]
+            return [Candle((self.now - timedelta(days=6-i//2)).replace(hour=9 if i % 2 == 0 else 13),
+                           value, value, value, value, D(1000), Currency.KRW)
+                    for i, value in enumerate(values)]
         self.stock = {'symbol': '005930', 'name': '테스트 대형주', 'securityType': 'STOCK',
                       'isCommonShare': True, 'sharesOutstanding': '100000000000'}
         self.engine.toss_client = Mock(candles=AsyncMock(side_effect=candles), stock_info=AsyncMock(return_value=self.stock),
@@ -94,24 +120,18 @@ class SwingTest(IsolatedAsyncioTestCase):
         await self.auto.prepare()
         self.engine.running = True
 
-    async def test_hold_overnight_no_fixed_exit_then_sell_upper(self):
+    async def test_three_percent_stop_loss(self):
         await self.setup_swing()
         await self.auto.tick()
         self.assertEqual([o.side for o in self.broker.orders], [Side.BUY])
-        self.price = D(155)  # Above old 2.5% target, but below upper band.
-        self.now = self.now.replace(hour=15, minute=10)
-        await self.auto.tick()
-        self.assertEqual(len(self.broker.orders), 1)
-        self.now += timedelta(days=1)
-        self.price = D(135)  # Below old stop loss; time/fixed exits are gone.
-        await self.auto.tick()
-        self.assertEqual(len(self.broker.orders), 1)
+        self.price = D(140)
         self.now += timedelta(minutes=5)
-        self.price = D(180)
         await self.auto.tick()
         self.assertEqual([o.side for o in self.broker.orders], [Side.BUY, Side.SELL])
         self.assertFalse(self.broker.positions)
         self.assertEqual(self.auto.report()['days'][0]['status'], '청산 완료')
+        traded_day = next(day for day in self.auto.days.values() if '005930' in day['targets'])
+        self.assertIn('-3% 손절', traded_day['outcome'])
 
     async def test_restart_does_not_duplicate_buy_and_report_keeps_long_hold(self):
         await self.setup_swing()
@@ -179,7 +199,7 @@ class SwingTest(IsolatedAsyncioTestCase):
         with patch('app.swing_recommendations.load_universe', return_value=(D('1e13'), {'005930': ['테스트 테마']})):
             payload = await build_swing_recommendations(self.engine)
         self.assertEqual(payload['candidates'][0]['themes'], ['테스트 테마'])
-        self.assertEqual(payload['candidates'][0]['strategy'], 'swing-v1')
+        self.assertEqual(payload['candidates'][0]['strategy'], 'swing-v2-mtf-4h')
         self.assertEqual(payload['funnel']['universe'], 1)
         self.engine.toss_client.rankings.assert_not_called()
 
@@ -255,7 +275,7 @@ class SwingTest(IsolatedAsyncioTestCase):
         with patch('app.swing_recommendations.load_universe', return_value=(D('1e12'), {'005930': ['테마'], '000660': ['테마']})):
             result = await build_swing_recommendations(self.engine)
         self.assertEqual([c['symbol'] for c in result['candidates']], ['005930'])
-        self.assertEqual(result['diagnostics']['rejection_counts']['일봉 조회 실패'], 1)
+        self.assertEqual(result['diagnostics']['rejection_counts']['시세 분석 조회 실패'], 1)
 
     async def test_budget_fees_limit_and_reuse_after_sale(self):
         from dataclasses import replace

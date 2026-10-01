@@ -6,13 +6,13 @@ import asyncio
 from app.morning_trader import MorningTrader, KST
 from app.models import Currency, Side, OrderStatus
 from app.paper import PaperBroker
-from app.swing_signals import swing_signal
+from app.swing_signals import four_hour_exit_signal, swing_signal, trend_context
 from app.swing_universe import load_universe, membership
 
 
 class SwingTrader(MorningTrader):
     """Multi-day paper holdings; no time exit, intraday averaging or fixed profit target."""
-    strategy = 'swing-v1'
+    strategy = 'swing-v2-mtf-4h'
 
     async def restore(self):
         saved = await self.engine.repository.load('swing_sessions')
@@ -73,7 +73,9 @@ class SwingTrader(MorningTrader):
         account = self.engine.broker.account(self.engine.quotes)
         budget = max(D(0), D(account['total_equity']['KRW']) * self.engine.settings.recommended_trade_ratio)
         invested = sum((p.quantity * p.average_price for p in self.engine.broker.positions.values() if p.currency is Currency.KRW), D(0))
-        remaining = max(D(0), min(D(account['cash']['KRW']), budget - invested))
+        remaining = max(D(0), min(D(account['cash']['KRW']), budget))
+        if len(self.engine.broker.positions) >= 5:
+            remaining = D(0)
         return budget, invested, remaining
 
     async def prepare(self):
@@ -83,7 +85,7 @@ class SwingTrader(MorningTrader):
             raise RuntimeError('스윙 자동매매에는 토스 시세 연결이 필요합니다.')
         await self.select_day()
         self.next_scan = datetime.min.replace(tzinfo=KST)
-        self.message = '스윙투자 · 일봉 하단 매수 / 상단 매도 · 여러 날 보유'
+        self.message = '스윙투자 · 주봉·일봉 추세 확인 / 4시간봉 눌림목 매수 / 일봉 상단 매도'
 
     def status(self):
         budget, invested, remaining = self.capital()
@@ -134,8 +136,35 @@ class SwingTrader(MorningTrader):
         return now.weekday() < 5 and time(9) <= now.time() < time(15, 30)
 
     async def signal(self, symbol, quote):
-        candles = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1d', 100), timeout=10)
-        return swing_signal(candles, quote.price, self.clock())
+        daily = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1d', 100), timeout=10)
+        context = trend_context(daily, quote.price, self.clock())
+        four_hour = []
+        if context.get('context_eligible'):
+            four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
+        return swing_signal(daily, quote.price, self.clock(), four_hour)
+
+    async def exit_signal(self, symbol, quote, position, day):
+        four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
+        signal = four_hour_exit_signal(four_hour, quote.price, self.clock())
+        target = day.setdefault('targets', {}).setdefault(symbol, {'symbol': symbol, 'name': symbol})
+        peak = D(target.get('exit_peak', '0'))
+        if signal.get('upper_touched'):
+            target['upper_band_touched'] = True
+            peak = max(peak, D(signal.get('active_high', quote.price)), quote.price)
+            target['exit_peak'] = str(peak)
+        elif target.get('upper_band_touched'):
+            peak = max(peak, quote.price)
+            target['exit_peak'] = str(peak)
+        stop_loss = quote.price <= position.average_price * D('.97')
+        trailing_exit = bool(target.get('upper_band_touched') and peak > 0
+                             and quote.price <= peak * D('.98'))
+        signal.update({'stop_loss': stop_loss, 'trailing_exit': trailing_exit,
+                       'sell': stop_loss or signal.get('sell_at_upper', False) or trailing_exit,
+                       'exit_reason': ('평균 매입가 대비 -3% 손절' if stop_loss else
+                                       '4시간봉 볼린저 상단 매도' if signal.get('sell_at_upper') else
+                                       '4시간봉 상단 터치 후 최고가 대비 -2% 매도' if trailing_exit else None)})
+        await self.save()
+        return signal
 
     async def store_observations(self, payload, source):
         observed_at = self.clock().isoformat()
@@ -255,6 +284,7 @@ class SwingTrader(MorningTrader):
                 return
             self.next_scan = now + timedelta(minutes=5)
             await self.select_day()
+            sell_filled = False
             # Exit every inherited automated holding, even if the theme list or scan fails.
             for day in list(self.days.values()):
                 orders = self.daily_orders(day)
@@ -267,22 +297,23 @@ class SwingTrader(MorningTrader):
                         if not position:
                             raise RuntimeError(f'{symbol}: 주문 기록과 보유 수량 불일치')
                         quote = await self.quote(symbol)
-                        signal = await self.signal(symbol, quote)
+                        signal = await self.exit_signal(symbol, quote, position, day)
                         if signal['sell'] and self.active() and self.market_open():
                             await self.record_order_attempt(Side.SELL, day=day)
                             order = await self.engine.broker.place_market_order(
                                 client_order_id=f"auto-{day['id']}-{symbol}-swing-sell", quote=quote,
                                 side=Side.SELL, quantity=min(position.quantity, quantity))
                             if order.status is OrderStatus.FILLED:
-                                day['outcome'] = '일봉 볼린저 상단 매도'
-                                self.message = f'{symbol} 일봉 볼린저 상단 매도 완료'
+                                sell_filled = True
+                                day['outcome'] = signal['exit_reason']
+                                self.message = f"{symbol} {signal['exit_reason']} 완료"
                                 await self.save()
                     except Exception as exc:
                         self.message = f'스윙 매도 확인 보류: {exc}'
                         self.session.setdefault('diagnostics', {})['last_error'] = str(exc)
                         await self.save()
             try:
-                payload = await asyncio.wait_for(self.recommend(), timeout=45)
+                payload = await asyncio.wait_for(self.recommend(), timeout=75)
                 await self.record_scan(payload=payload)
                 filled_before = self.session.get('diagnostics', {}).get('buy_orders_filled', 0)
                 minimum, themes = load_universe()
@@ -298,10 +329,9 @@ class SwingTrader(MorningTrader):
                     signal = await self.signal(symbol, quote)
                     if not signal['eligible']:
                         continue
-                    budget, _, remaining = self.capital()
+                    _, _, allowance = self.capital()
                     settings = self.engine.settings
                     fill = quote.price * (1 + settings.slippage_bps / D(10000))
-                    allowance = min(remaining, budget / 5)
                     quantity = min(int(allowance // (fill * (1 + settings.fee_rate))), int(settings.max_order_amount_krw // fill))
                     if quantity < 1 or not self.active() or not self.market_open():
                         continue
@@ -314,7 +344,7 @@ class SwingTrader(MorningTrader):
                     await self.record_order_attempt(Side.BUY)
                     order = await self.engine.broker.place_market_order(
                         client_order_id=f"auto-{self.session['id']}-{symbol}-swing-buy", quote=quote,
-                        side=Side.BUY, quantity=D(quantity))
+                        side=Side.BUY, quantity=D(quantity), order_budget=allowance)
                     if order.status is OrderStatus.FILLED:
                         data = self.session.setdefault('diagnostics', {})
                         data['buy_orders_filled'] = data.get('buy_orders_filled', 0) + 1
@@ -322,7 +352,7 @@ class SwingTrader(MorningTrader):
                         self.message = f'{symbol} {quantity}주 스윙 매수'
                     await self.save()
                 filled_after = self.session.get('diagnostics', {}).get('buy_orders_filled', 0)
-                if filled_after == filled_before:
+                if filled_after == filled_before and not sell_filled:
                     self.session['outcome'] = '매수 조건 대기'
                     self.message = ('검색 완료 · 현재 매수 조건을 충족한 후보 없음' if not payload['candidates']
                                     else '검색 완료 · 후보의 보유 여부·예산·주문 전 조건에 따라 신규 매수 없음')

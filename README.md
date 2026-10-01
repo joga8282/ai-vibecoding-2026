@@ -22,7 +22,7 @@
 ### DB와 매매 내역 저장 위치
 
 - 기본 SQLite 파일은 `data/auto_trader.db`이며 `.env`의 `DATABASE_PATH`로 지정합니다.
-- `snapshots` 테이블의 `name='paper_account'` 행에서 JSON `payload.orders`에 주문 내역, `payload.positions`에 보유 종목, `payload.cash`에 잔액을 저장합니다. `paper_account`는 가상계좌 데이터 구분 이름입니다.
+- `trade_orders` 테이블에 매수·매도 주문 한 건을 한 행으로 저장하고, `portfolio_positions` 테이블에는 현재 보유 종목명·수량·평균 매입가·매입금액을 종목별 한 행으로 저장합니다. 원본 가상계좌 상태도 `snapshots` 테이블의 `name='paper_account'` 행에 보관합니다.
 - 주문에는 종목, 매수/매도, 수량, 요청가·체결가, 수수료, 체결 상태, 주문 시각이 포함됩니다. 현재 저장 방식은 최근 1,000건을 유지합니다.
 - 스윙매매 세션·진단은 같은 테이블의 `swing_sessions`에 저장합니다. 화면의 매매 내역과 `GET /api/v1/orders`에서 주문을 확인할 수 있습니다.
 - 검색·신호 학습 데이터는 별도 `signal_observations` 테이블에 계속 추가되므로 체결 조건이 드문 날에도 분석 데이터가 쌓입니다.

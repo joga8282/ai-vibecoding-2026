@@ -77,6 +77,39 @@ class PaperBroker:
             for item in snapshot.get("orders", [])
         ]
 
+    async def get_accounts(self) -> list[dict]:
+        return [{'account_ref': 'paper', 'mode': 'paper'}]
+
+    async def get_positions(self) -> list[dict]:
+        return serialize(list(self.positions.values()))
+
+    async def get_buying_power(self, symbol: str | None = None) -> dict:
+        return {'KRW': str(self.cash[Currency.KRW]), 'USD': str(self.cash[Currency.USD])}
+
+    async def get_sellable_quantity(self, symbol: str) -> dict:
+        position = self.positions.get(symbol)
+        return {'symbol': symbol, 'quantity': str(position.quantity if position else Decimal(0))}
+
+    async def list_orders(self, status: str | None = None) -> list[dict]:
+        orders = self.orders if status is None else [order for order in self.orders if order.status.value == status]
+        return serialize(orders)
+
+    async def get_order(self, order_id: str) -> dict:
+        order = next((order for order in self.orders if order.order_id == order_id), None)
+        if not order:
+            raise LookupError(order_id)
+        return serialize(order)
+
+    async def place_order(self, request: dict) -> dict:
+        order = await self.place_market_order(**request)
+        return serialize(order)
+
+    async def cancel_order(self, order_id: str) -> dict:
+        raise RuntimeError('PAPER 시장가 주문은 즉시 체결되어 취소할 수 없습니다.')
+
+    async def reconcile(self) -> dict:
+        return {'reconciled': True, 'mode': 'paper', 'mismatches': []}
+
     async def reset(self, cash_krw: Decimal, cash_usd: Decimal) -> None:
         if cash_krw < 0 or cash_usd < 0:
             raise ValueError("초기자금은 0 이상이어야 합니다.")
@@ -194,6 +227,7 @@ class PaperBroker:
                     "market_price": str(market_price),
                     "market_value": str(market_value),
                     "unrealized_profit_loss": str(pnl),
+                    "quote_timestamp": quote.timestamp.isoformat() if quote else None,
                 }
             )
         return {

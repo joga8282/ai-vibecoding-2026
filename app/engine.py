@@ -41,6 +41,7 @@ class TradingEngine:
         self._task: asyncio.Task | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._buy_candles: dict[str, tuple[datetime, list[Candle]]] = {}
+        self._four_hour_candles: dict[str, tuple[datetime, list[Candle]]] = {}
         self.buy_filter_status: dict[str, str] = {}
         self._stock_names: dict[str, tuple[datetime, str | None]] = {}
         self._stock_names_lock = asyncio.Lock()
@@ -160,10 +161,20 @@ class TradingEngine:
 
     async def candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         symbol = symbol.upper()
-        minute_intervals = {"1m": 1, "5m": 5, "15m": 15, "50m": 50, "60m": 60}
+        now = datetime.now(timezone.utc)
+        if interval == "4h":
+            cached = self._four_hour_candles.get(symbol)
+            if cached and now - cached[0] < timedelta(minutes=4) and len(cached[1]) >= count:
+                return cached[1][-count:]
+        minute_intervals = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "50m": 50, "60m": 60, "4h": 240}
         base_interval = "1m" if interval in minute_intervals else "1d"
         if interval == base_interval:
             source_count = count
+        elif interval == "4h":
+            # A Korean trading day produces two four-hour buckets (09:00 and
+            # 13:00).  The old 3,000-minute cap only covered about eight
+            # sessions, so the chart frequently stopped at 8-9 candles.
+            source_count = min(count * minute_intervals[interval], 12000)
         elif interval in minute_intervals:
             source_count = min(count * minute_intervals[interval], 3000)
         elif interval == "1w":
@@ -190,13 +201,20 @@ class TradingEngine:
             ]
         if interval == base_interval:
             return sorted(source, key=lambda item: item.timestamp)[-count:]
-        return self._aggregate_candles(source, interval)[-count:]
+        result = self._aggregate_candles(source, interval)[-count:]
+        if interval == "4h":
+            self._four_hour_candles[symbol] = (now, result)
+        return result
 
     @staticmethod
     def _aggregate_candles(candles: list[Candle], interval: str) -> list[Candle]:
-        minute_intervals = {"5m": 5, "15m": 15, "50m": 50, "60m": 60}
+        minute_intervals = {"5m": 5, "15m": 15, "30m": 30, "50m": 50, "60m": 60}
 
         def bucket(timestamp: datetime) -> datetime:
+            if interval == "4h":
+                local = timestamp.astimezone(timezone(timedelta(hours=9)))
+                hour = 9 if local.time() < time(13) else 13
+                return local.replace(hour=hour, minute=0, second=0, microsecond=0)
             if interval in minute_intervals:
                 minutes = minute_intervals[interval]
                 start_of_day = datetime.combine(

@@ -10,7 +10,7 @@ from app.swing_recommendations import build_swing_recommendations
 
 
 async def build_recommendations(engine, report_direction="neutral") -> dict:
-    if getattr(engine.automation, 'strategy', None) == 'swing-v1':
+    if str(getattr(engine.automation, 'strategy', '')).startswith('swing-v'):
         try:
             result = await build_swing_recommendations(engine)
         except Exception as exc:

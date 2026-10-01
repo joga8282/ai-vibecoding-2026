@@ -5,6 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from decimal import Decimal
 from typing import Any
 
 
@@ -37,6 +38,62 @@ class SnapshotRepository:
                     "CREATE INDEX IF NOT EXISTS idx_signal_observations_time "
                     "ON signal_observations(observed_at DESC)"
                 )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS trade_orders ("
+                    "order_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, symbol TEXT NOT NULL, "
+                    "side TEXT NOT NULL, quantity TEXT NOT NULL, requested_price TEXT NOT NULL, "
+                    "filled_price TEXT, currency TEXT NOT NULL, status TEXT NOT NULL, fee TEXT NOT NULL, "
+                    "reason TEXT, created_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_trade_orders_created_at "
+                    "ON trade_orders(created_at DESC)"
+                )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS portfolio_positions ("
+                    "symbol TEXT PRIMARY KEY, name TEXT, quantity TEXT NOT NULL, "
+                    "average_price TEXT NOT NULL, purchase_amount TEXT NOT NULL, "
+                    "currency TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                )
+                connection.execute("CREATE TABLE IF NOT EXISTS broker_accounts ("
+                                   "account_ref TEXT PRIMARY KEY, mode TEXT NOT NULL, last_sync_at TEXT, status TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS live_orders ("
+                                   "internal_order_id TEXT PRIMARY KEY, broker_order_id TEXT UNIQUE, client_order_id TEXT UNIQUE NOT NULL, "
+                                   "account_ref TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, order_type TEXT NOT NULL, "
+                                   "requested_price TEXT, requested_quantity TEXT NOT NULL, filled_quantity TEXT NOT NULL DEFAULT '0', "
+                                   "average_filled_price TEXT, remaining_quantity TEXT NOT NULL, commission TEXT NOT NULL DEFAULT '0', "
+                                   "tax TEXT NOT NULL DEFAULT '0', status TEXT NOT NULL, reason TEXT, strategy TEXT, signal_id TEXT, "
+                                   "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS live_executions ("
+                                   "execution_id TEXT PRIMARY KEY, broker_order_id TEXT NOT NULL, quantity TEXT NOT NULL, "
+                                   "price TEXT NOT NULL, commission TEXT NOT NULL DEFAULT '0', tax TEXT NOT NULL DEFAULT '0', filled_at TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS live_positions ("
+                                   "account_ref TEXT NOT NULL, symbol TEXT NOT NULL, name TEXT, quantity TEXT NOT NULL, "
+                                   "average_price TEXT, market_price TEXT, market_value TEXT, profit_loss TEXT, synced_at TEXT NOT NULL, "
+                                   "PRIMARY KEY(account_ref, symbol))")
+                connection.execute("CREATE TABLE IF NOT EXISTS account_snapshots ("
+                                   "id INTEGER PRIMARY KEY AUTOINCREMENT, account_ref TEXT NOT NULL, captured_at TEXT NOT NULL, "
+                                   "holdings TEXT NOT NULL, orders TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS reconciliation_events ("
+                                   "id INTEGER PRIMARY KEY AUTOINCREMENT, account_ref TEXT NOT NULL, reconciled INTEGER NOT NULL, "
+                                   "detail TEXT, created_at TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS risk_events ("
+                                   "id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, rule TEXT NOT NULL, allowed INTEGER NOT NULL, "
+                                   "detail TEXT, created_at TEXT NOT NULL)")
+                connection.execute("CREATE TABLE IF NOT EXISTS trading_audit_log ("
+                                   "id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)")
+                position_columns = {row[1] for row in connection.execute("PRAGMA table_info(portfolio_positions)")}
+                if 'name' not in position_columns:
+                    connection.execute("ALTER TABLE portfolio_positions ADD COLUMN name TEXT")
+                if 'purchase_amount' not in position_columns:
+                    connection.execute("ALTER TABLE portfolio_positions ADD COLUMN purchase_amount TEXT")
+                saved = connection.execute(
+                    "SELECT payload FROM snapshots WHERE name = 'paper_account'"
+                ).fetchone()
+                if saved:
+                    account = json.loads(saved[0])
+                    self._replace_trade_orders(connection, account.get('orders', []))
+                    self._replace_portfolio_positions(connection, account.get('positions', []))
 
     async def load(self, name: str) -> dict[str, Any] | None:
         return await asyncio.to_thread(self._load_sync, name)
@@ -62,6 +119,95 @@ class SnapshotRepository:
                     "payload = excluded.payload, updated_at = excluded.updated_at",
                     (name, encoded),
                 )
+                if name == 'paper_account':
+                    self._replace_trade_orders(connection, payload.get('orders', []))
+                    self._replace_portfolio_positions(connection, payload.get('positions', []))
+
+    @staticmethod
+    def _replace_trade_orders(connection: sqlite3.Connection, orders: list[dict[str, Any]]) -> None:
+        """Keep a query-friendly order ledger in sync with the PAPER account snapshot."""
+        connection.execute("DELETE FROM trade_orders")
+        if not orders:
+            return
+        connection.executemany(
+            "INSERT INTO trade_orders("
+            "order_id, client_order_id, symbol, side, quantity, requested_price, filled_price, "
+            "currency, status, fee, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(
+                order['order_id'], order['client_order_id'], order['symbol'], order['side'],
+                order['quantity'], order['requested_price'], order.get('filled_price'),
+                order['currency'], order['status'], order.get('fee', '0'), order.get('reason'),
+                order['created_at'],
+            ) for order in orders],
+        )
+
+    @staticmethod
+    def _replace_portfolio_positions(connection: sqlite3.Connection, positions: list[dict[str, Any]]) -> None:
+        """Keep current PAPER holdings queryable as one database row per symbol."""
+        names = dict(connection.execute("SELECT symbol, name FROM portfolio_positions WHERE name IS NOT NULL"))
+        connection.execute("DELETE FROM portfolio_positions")
+        if not positions:
+            return
+        connection.executemany(
+            "INSERT INTO portfolio_positions(symbol, name, quantity, average_price, purchase_amount, currency, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            [(position['symbol'], position.get('name') or names.get(position['symbol']),
+              position['quantity'], position['average_price'],
+              str(Decimal(position['quantity']) * Decimal(position['average_price'])), position['currency'])
+             for position in positions],
+        )
+
+    async def update_position_names(self, names: dict[str, str]) -> None:
+        await asyncio.to_thread(self._update_position_names_sync, names)
+
+    def _update_position_names_sync(self, names: dict[str, str]) -> None:
+        if not names:
+            return
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.executemany(
+                    "UPDATE portfolio_positions SET name = ? WHERE symbol = ?",
+                    [(name, symbol) for symbol, name in names.items() if name],
+                )
+
+    async def save_live_account_snapshot(self, account_ref: str, holdings: list[dict],
+                                         orders: list[dict], captured_at: str) -> None:
+        await asyncio.to_thread(self._save_live_account_snapshot_sync, account_ref, holdings, orders, captured_at)
+
+    def _save_live_account_snapshot_sync(self, account_ref, holdings, orders, captured_at):
+        encoded_holdings = json.dumps(holdings, ensure_ascii=False, separators=(',', ':'))
+        encoded_orders = json.dumps(orders, ensure_ascii=False, separators=(',', ':'))
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute("INSERT INTO account_snapshots(account_ref,captured_at,holdings,orders) VALUES(?,?,?,?)",
+                                   (account_ref, captured_at, encoded_holdings, encoded_orders))
+                connection.execute("INSERT INTO broker_accounts(account_ref,mode,last_sync_at,status) VALUES(?, 'live-readonly', ?, 'SYNCED') "
+                                   "ON CONFLICT(account_ref) DO UPDATE SET last_sync_at=excluded.last_sync_at,status=excluded.status",
+                                   (account_ref, captured_at))
+                connection.execute("DELETE FROM live_positions WHERE account_ref=?", (account_ref,))
+                for item in holdings:
+                    symbol = item.get('symbol') or item.get('stock', {}).get('symbol')
+                    if not symbol:
+                        continue
+                    connection.execute("INSERT INTO live_positions(account_ref,symbol,name,quantity,average_price,market_price,market_value,profit_loss,synced_at) "
+                                       "VALUES(?,?,?,?,?,?,?,?,?)",
+                                       (account_ref, symbol, item.get('name'), str(item.get('quantity', '0')),
+                                        str(item.get('averagePrice') or item.get('average_price') or ''),
+                                        str(item.get('marketPrice') or item.get('market_price') or ''),
+                                        str(item.get('marketValue') or item.get('market_value') or ''),
+                                        str(item.get('profitLoss') or item.get('profit_loss') or ''), captured_at))
+                connection.execute("INSERT INTO reconciliation_events(account_ref,reconciled,detail,created_at) VALUES(?,1,?,?)",
+                                   (account_ref, f'holdings={len(holdings)},orders={len(orders)}', captured_at))
+
+    async def append_reconciliation_event(self, account_ref: str, reconciled: bool,
+                                          detail: str, created_at: str) -> None:
+        await asyncio.to_thread(self._append_reconciliation_event_sync, account_ref, reconciled, detail, created_at)
+
+    def _append_reconciliation_event_sync(self, account_ref, reconciled, detail, created_at):
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute("INSERT INTO reconciliation_events(account_ref,reconciled,detail,created_at) VALUES(?,?,?,?)",
+                                   (account_ref, int(reconciled), detail, created_at))
 
     async def append_signal_observations(self, rows: list[dict[str, Any]]) -> int:
         return await asyncio.to_thread(self._append_signal_observations_sync, rows)

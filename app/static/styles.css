@@ -443,6 +443,16 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--card);
+  cursor: pointer;
+  transition: border-color .15s, transform .15s, box-shadow .15s;
+}
+
+.recommendation-card:hover,
+.recommendation-card:focus-visible {
+  border-color: var(--blue);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .18);
+  outline: none;
 }
 
 .recommendation-card h3,
@@ -473,6 +483,118 @@ h2 {
 
 .recommendation-watchlist {
   margin-top: 22px;
+}
+
+.candidate-chart {
+  margin-top: 20px;
+  padding: 18px;
+  background: var(--surface);
+}
+
+.chart-heading,
+.chart-periods,
+.minute-periods {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chart-heading {
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.chart-periods,
+.minute-periods {
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.minute-periods {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--inset);
+}
+
+.chart-period {
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chart-period.active {
+  color: #fff;
+  border-color: var(--blue);
+  background: var(--blue);
+}
+
+.chart-canvas {
+  min-height: 300px;
+  display: grid;
+  place-items: center;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--inset);
+}
+
+.price-chart {
+  display: block;
+  width: 100%;
+  min-width: 680px;
+  height: auto;
+}
+
+.chart-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.chart-axis {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+.candle-up line,
+.candle-up rect {
+  stroke: var(--red);
+  fill: var(--red);
+}
+
+.candle-down line,
+.candle-down rect {
+  stroke: var(--blue-2);
+  fill: var(--blue-2);
+}
+
+.moving-average {
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-legend {
+  fill: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.volume-up {
+  fill: color-mix(in srgb, var(--red) 62%, transparent);
+}
+
+.volume-down {
+  fill: color-mix(in srgb, var(--blue-2) 62%, transparent);
 }
 
 .diagnostics-grid > div {
@@ -591,6 +713,47 @@ tr:last-child td {
   color: var(--blue-2);
   background: transparent;
   font-size: 12px;
+}
+
+.investment-dialog {
+  width: min(520px, calc(100% - 32px));
+  padding: 24px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.investment-dialog::backdrop {
+  background: rgba(3, 7, 14, .72);
+  backdrop-filter: blur(3px);
+}
+
+.investment-ratio-control {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px 0 14px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.investment-ratio-control strong {
+  color: var(--blue-2);
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+}
+
+#investmentRatioInput {
+  width: 100%;
+  accent-color: var(--blue);
+}
+
+.investment-dialog-actions {
+  justify-content: flex-end;
+  margin-top: 20px;
 }
 
 .quote-list {

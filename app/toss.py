@@ -117,6 +117,55 @@ class TossMarketClient:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)
 
+    async def _account_get(self, path: str, account_seq: str | None = None,
+                           parameters: dict | None = None):
+        token = await self._access_token()
+        query = urllib.parse.urlencode({k: v for k, v in (parameters or {}).items() if v is not None})
+        url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
+        headers = {"Authorization": f"Bearer {token}"}
+        if account_seq is not None:
+            headers["X-Tossinvest-Account"] = str(account_seq)
+        payload = await asyncio.to_thread(
+            self._request_json_sync, urllib.request.Request(url, headers=headers)
+        )
+        return payload.get('result', payload)
+
+    async def accounts(self) -> list[dict]:
+        result = await self._account_get('/api/v1/accounts')
+        return result if isinstance(result, list) else result.get('accounts', [])
+
+    async def holdings(self, account_seq: str) -> list[dict]:
+        result = await self._account_get('/api/v1/holdings', account_seq)
+        if isinstance(result, list):
+            return result
+        return result.get('holdings') or result.get('positions') or []
+
+    async def buying_power(self, account_seq: str, symbol: str | None = None) -> dict:
+        result = await self._account_get('/api/v1/buying-power', account_seq, {'symbol': symbol})
+        return result if isinstance(result, dict) else {'items': result}
+
+    async def sellable_quantity(self, account_seq: str, symbol: str) -> dict:
+        result = await self._account_get('/api/v1/sellable-quantity', account_seq, {'symbol': symbol})
+        return result if isinstance(result, dict) else {'items': result}
+
+    async def account_orders(self, account_seq: str, status: str | None = None) -> list[dict]:
+        result = await self._account_get('/api/v1/orders', account_seq, {'status': status})
+        if isinstance(result, list):
+            return result
+        return result.get('orders') or result.get('items') or []
+
+    async def account_order(self, account_seq: str, order_id: str) -> dict:
+        result = await self._account_get(f'/api/v1/orders/{urllib.parse.quote(order_id)}', account_seq)
+        return result if isinstance(result, dict) else {'items': result}
+
+    async def commissions(self, account_seq: str) -> dict:
+        result = await self._account_get('/api/v1/commissions', account_seq)
+        return result if isinstance(result, dict) else {'items': result}
+
+    async def market_calendar(self, country: str = 'KR') -> dict:
+        result = await self._account_get(f'/api/v1/market-calendar/{country.upper()}')
+        return result if isinstance(result, dict) else {'items': result}
+
     async def search_stocks(self, query: str, limit: int = 10) -> list[dict]:
         """Search active Korean stocks by Korean name or symbol."""
         if self._korean_stocks is None:
