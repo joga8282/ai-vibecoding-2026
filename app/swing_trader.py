@@ -73,7 +73,7 @@ class SwingTrader(MorningTrader):
         account = self.engine.broker.account(self.engine.quotes)
         budget = max(D(0), D(account['total_equity']['KRW']) * self.engine.settings.recommended_trade_ratio)
         invested = sum((p.quantity * p.average_price for p in self.engine.broker.positions.values() if p.currency is Currency.KRW), D(0))
-        remaining = max(D(0), min(D(account['cash']['KRW']), budget))
+        remaining = max(D(0), min(D(account['cash']['KRW']), budget - invested))
         if len(self.engine.broker.positions) >= 5:
             remaining = D(0)
         return budget, invested, remaining
@@ -94,13 +94,13 @@ class SwingTrader(MorningTrader):
         elif not self.engine.running:
             execution_state = '자동매매 중지 · 시작 버튼을 눌러야 검색합니다'
         elif not self.market_open():
-            execution_state = '장외 대기 · 평일 09:00~15:30에 오전·오후 모두 검색합니다'
+            execution_state = '장외 대기 · 평일 정규장 및 16:00~20:00 애프터마켓에 검색합니다'
         else:
-            execution_state = '장중 자동매매 실행 · 오전·오후 구분 없이 5분마다 확인'
+            execution_state = '매도 감시 중 · 자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00'
         return {'strategy': self.strategy, 'budget': str(budget), 'spent': str(invested),
                 'remaining': str(remaining), 'message': self.message,
                 'execution_state': execution_state, 'market_open': self.market_open(),
-                'trading_hours': '평일 09:00~15:30 (한국시간)',
+                'trading_hours': '자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00 · PAPER 수동매수·매도 평일 09:00~15:30, 16:00~20:00',
                 'signal_observation_count': getattr(self, 'observation_count', 0),
                 'next_scan_at': max(self.clock(), self.next_scan).isoformat() if self.active() and self.market_open() else None,
                 'targets': [target for day in self.days.values() for target in day['targets'].values()
@@ -133,15 +133,79 @@ class SwingTrader(MorningTrader):
 
     def market_open(self):
         now = self.clock().astimezone(KST)
-        return now.weekday() < 5 and time(9) <= now.time() < time(15, 30)
+        current = now.time()
+        regular_session = time(9) <= current < time(15, 30)
+        after_market = time(16) <= current < time(20)
+        return now.weekday() < 5 and (regular_session or after_market)
+
+    def buy_window_open(self):
+        now = self.clock().astimezone(KST)
+        current = now.time()
+        regular_buy_window = time(9) <= current < time(10) or time(12) <= current < time(14)
+        after_market_buy_window = time(16) <= current < time(20)
+        return now.weekday() < 5 and (regular_buy_window or after_market_buy_window)
+
+    async def buy_qualified(self, symbol):
+        """Recheck an eligible candidate and buy one asset-ratio allocation in PAPER."""
+        async with self._lock:
+            if self.engine.settings.mode != 'paper' or type(self.engine.broker) is not PaperBroker:
+                raise RuntimeError('PAPER 주문만 지원합니다.')
+            if self.engine.kill_switch:
+                raise RuntimeError('킬 스위치가 활성화되어 있습니다.')
+            if not self.market_open():
+                raise RuntimeError('매수는 평일 정규장 09:00~15:30 또는 애프터마켓 16:00~20:00에 가능합니다.')
+            if not self.engine.toss_client:
+                raise RuntimeError('토스 시세 연결이 필요합니다.')
+            already_held = symbol in self.engine.broker.positions
+            if len(self.engine.broker.positions) >= 5 and not already_held:
+                raise RuntimeError('최대 보유 종목 수에 도달했습니다.')
+            await self.select_day()
+            minimum, themes = load_universe()
+            if symbol not in themes:
+                raise RuntimeError('등록 테마에 없는 종목입니다.')
+            quote = await self.quote(symbol)
+            stock = await asyncio.wait_for(self.engine.toss_client.stock_info(symbol), timeout=10)
+            if not membership(stock, quote.price, minimum, themes):
+                raise RuntimeError('시가총액 또는 국내 보통주 조건을 충족하지 않습니다.')
+            signal = await self.signal(symbol, quote)
+            if not signal.get('eligible'):
+                raise RuntimeError('현재 자동매수 조건을 충족하지 않습니다.')
+            budget = max(D(0), D(self.engine.broker.account(self.engine.quotes)['total_equity']['KRW'])
+                         * self.engine.settings.recommended_trade_ratio)
+            # A manual click is an explicit repeat entry. Keep the allocation,
+            # cash, and per-order limits while allowing an existing symbol to add shares.
+            allowance = min(D(self.engine.broker.cash[Currency.KRW]), budget)
+            settings = self.engine.settings
+            fill = quote.price * (1 + settings.slippage_bps / D(10000))
+            quantity = min(int(allowance // (fill * (1 + settings.fee_rate))),
+                           int(settings.max_order_amount_krw // fill))
+            if quantity < 1:
+                raise RuntimeError('자산 비율 예산 또는 가용 현금으로 1주를 매수할 수 없습니다.')
+            target = self.session['targets'].setdefault(symbol, {'symbol': symbol})
+            target.update({'name': stock.get('name') or symbol, 'themes': themes[symbol],
+                           'entered_at': self.clock().isoformat(), 'manual_qualified_buy': True})
+            await self.save()
+            await self.record_order_attempt(Side.BUY)
+            order = await self.engine.broker.place_market_order(
+                client_order_id=f"auto-{self.session['id']}-{symbol}-swing-manual-buy-{uuid4().hex}",
+                quote=quote, side=Side.BUY, quantity=D(quantity), order_budget=min(budget, allowance))
+            if order.status is not OrderStatus.FILLED:
+                raise RuntimeError(f'PAPER 매수 거절: {order.reason}')
+            data = self.session.setdefault('diagnostics', {})
+            data['buy_orders_filled'] = data.get('buy_orders_filled', 0) + 1
+            self.session['outcome'] = '스윙 보유 · 상단 매도 대기'
+            self.message = f'{stock.get("name") or symbol} {quantity}주 자산 비율 PAPER 매수'
+            await self.save()
+            return order
 
     async def signal(self, symbol, quote):
         daily = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1d', 100), timeout=10)
-        context = trend_context(daily, quote.price, self.clock())
+        weekly = await asyncio.wait_for(self.engine.candles(symbol, '1w', 60), timeout=20)
+        context = trend_context(daily, quote.price, self.clock(), weekly)
         four_hour = []
         if context.get('context_eligible'):
             four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
-        return swing_signal(daily, quote.price, self.clock(), four_hour)
+        return swing_signal(daily, quote.price, self.clock(), four_hour, weekly)
 
     async def exit_signal(self, symbol, quote, position, day):
         four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
@@ -188,7 +252,7 @@ class SwingTrader(MorningTrader):
             if self.engine.kill_switch:
                 raise RuntimeError('킬 스위치를 해제한 뒤 테스트하세요.')
             if not self.market_open():
-                raise RuntimeError('테스트 매수는 평일 09:00~15:30에 가능합니다.')
+                raise RuntimeError('테스트 매수는 평일 정규장 09:00~15:30 또는 애프터마켓 16:00~20:00에 가능합니다.')
             if not self.engine.toss_client:
                 raise RuntimeError('테스트 매수에는 토스 시세 연결이 필요합니다.')
             if symbol in self.engine.broker.positions:
@@ -240,7 +304,7 @@ class SwingTrader(MorningTrader):
             if self.engine.kill_switch:
                 raise RuntimeError('킬 스위치를 해제한 뒤 매도하세요.')
             if not self.market_open():
-                raise RuntimeError('수동 매도는 평일 09:00~15:30에 가능합니다.')
+                raise RuntimeError('수동 매도는 평일 정규장 09:00~15:30 또는 애프터마켓 16:00~20:00에 가능합니다.')
             position = self.engine.broker.positions.get(symbol)
             if not position:
                 raise RuntimeError('이미 청산되었거나 보유하지 않은 종목입니다.')
@@ -333,7 +397,7 @@ class SwingTrader(MorningTrader):
                     settings = self.engine.settings
                     fill = quote.price * (1 + settings.slippage_bps / D(10000))
                     quantity = min(int(allowance // (fill * (1 + settings.fee_rate))), int(settings.max_order_amount_krw // fill))
-                    if quantity < 1 or not self.active() or not self.market_open():
+                    if quantity < 1 or not self.active() or not self.market_open() or not self.buy_window_open():
                         continue
                     self.session['targets'][symbol] = {'symbol': symbol, 'name': candidate.get('name') or symbol,
                                                        'themes': themes[symbol], 'entered_at': self.clock().isoformat()}

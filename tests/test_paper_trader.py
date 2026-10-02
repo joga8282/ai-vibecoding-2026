@@ -224,6 +224,10 @@ class PaperTraderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(aggregated[1].volume, Decimal("20"))
         self.assertEqual(aggregated[2].volume, Decimal("10"))
 
+        self.engine.toss_client = Mock(candles=AsyncMock(return_value=source))
+        regular_only = await self.engine.candles("005930", "4h", 10)
+        self.assertEqual([bar.volume for bar in regular_only], [Decimal("20"), Decimal("10"), Decimal("10")])
+
     async def test_korean_stock_name_search_prefers_exact_match(self) -> None:
         client = TossMarketClient("test", "test")
         client._korean_stocks = [

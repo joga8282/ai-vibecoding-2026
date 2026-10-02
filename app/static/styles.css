@@ -751,6 +751,39 @@ tr:last-child td {
   accent-color: var(--blue);
 }
 
+.capital-ratio-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.capital-ratio-control strong {
+  color: var(--blue-2);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+#capitalRatioInput {
+  display: block;
+  width: 100%;
+  margin: 0 0 4px;
+  accent-color: var(--blue);
+  cursor: grab;
+}
+
+#capitalRatioInput:active {
+  cursor: grabbing;
+}
+
+#capitalRatioPreview {
+  display: block;
+  min-height: 2.5em;
+}
+
 .investment-dialog-actions {
   justify-content: flex-end;
   margin-top: 20px;

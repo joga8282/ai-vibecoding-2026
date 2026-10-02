@@ -17,7 +17,7 @@ class AutoTraderTest(IsolatedAsyncioTestCase):
 
     async def setup_auto(self, count=5):
         candles = trend_candles()
-        self.price = candles[-1].close_price
+        self.price = D('110.6')
         self.engine.toss_client = Mock(
             candles=AsyncMock(return_value=candles),
             prices=AsyncMock(side_effect=lambda symbols: [Quote(s, self.price, Currency.KRW, utc_now(), 'toss') for s in symbols]),
@@ -152,12 +152,12 @@ class AutoTraderTest(IsolatedAsyncioTestCase):
             result = await routes['/api/v1/engine/start'](request)
             self.assertEqual(result['mode'], 'paper')
             self.assertEqual(result['automation']['strategy'], 'swing-v2-mtf-4h')
-            self.assertEqual(D(result['automation']['budget']), D('500000'))
+            self.assertEqual(D(result['automation']['budget']), D('100000'))
             result = await routes['/api/v1/engine/stop'](request)
             self.assertFalse(result['running'])
         async with app.router.lifespan_context(app):
             self.assertFalse(app.state.engine.running)
-            self.assertEqual(D(app.state.engine.automation.session['budget']), D('500000'))
+            self.assertEqual(D(app.state.engine.automation.session['budget']), D('100000'))
 
     async def test_shared_recommendation_service_provides_allocated_quantities(self):
         from app.recommendation_service import build_recommendations

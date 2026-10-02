@@ -20,7 +20,7 @@ def trend_candles():
 class RecommendationFiltersTest(TestCase):
     def test_uptrend_lower_band_recovery_qualifies(self):
         candles = trend_candles()
-        result = analyze_candidate(candles, candles[-1].close_price, D('.01'))
+        result = analyze_candidate(candles, D('110.6'), D('.01'))
         self.assertTrue(result['uptrend'])
         self.assertTrue(result['bollinger_touched'])
         self.assertTrue(result['eligible'])
@@ -32,7 +32,7 @@ class RecommendationFiltersTest(TestCase):
         for candle in candles[-60:-1]:
             candle.low_price = D('104')
         candles[-1].low_price = D('108')
-        result = analyze_candidate(candles, candles[-1].close_price, D('.01'))
+        result = analyze_candidate(candles, D('110.6'), D('.01'))
         self.assertFalse(result['support_touched'])
         self.assertTrue(result['bollinger_touched'])
         self.assertTrue(result['eligible'])
@@ -57,7 +57,7 @@ class RecommendationFiltersTest(TestCase):
         candles = trend_candles()
         for rate, eligible in [(D('.0699'), True), (D('.07'), False)]:
             with self.subTest(rate=rate):
-                result = analyze_candidate(candles, candles[-1].close_price, rate)
+                result = analyze_candidate(candles, D('110.6'), rate)
                 self.assertEqual(result['eligible'], eligible)
 
     def test_flat_market_is_not_overbought_or_a_band_touch(self):
@@ -89,7 +89,7 @@ class BuyFilterTest(IsolatedAsyncioTestCase):
     async def test_buy_filter_passes_and_reuses_candles(self):
         candles = trend_candles()
         self.engine.toss_client = Mock(candles=AsyncMock(return_value=candles))
-        quote = Quote('005930', candles[-1].close_price, Currency.KRW, utc_now())
+        quote = Quote('005930', D('110.6'), Currency.KRW, utc_now())
         self.assertTrue(await self.engine._buy_allowed(quote))
         self.assertTrue(await self.engine._buy_allowed(quote))
         self.engine.toss_client.candles.assert_awaited_once()

@@ -41,7 +41,7 @@
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
             <p id="autoBudgetStatus" class="muted">최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 추적 매도</p>
             <p class="muted">매수 신호 시 총평가금액의 설정 비율로 1회 일괄 매수 · 종목별 분할매수 없음</p>
-            <p class="muted">평일 09:00~15:30 · 5분 간격 확인 · 최대 5종목 · 평균가 -3% 손절 · 4시간봉 상단 또는 터치 후 최고가 -2% 매도</p>
+            <p class="muted">평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00 · 5분 간격 확인 · PAPER 주문</p>
             <p class="muted">최대 5종목 보유 · 5종목이면 기존 매도 조건으로 자리가 날 때까지 신규 매수 대기</p>
           </div>
           <div class="control-row">
@@ -112,6 +112,12 @@
               <span>이번 추천에 사용할 금액</span>
               <strong id="capitalRecommendationAmount">-</strong>
               <small id="capitalRecommendationHelp">설정된 추천 거래 비율 이내에서 가용 현금 사용</small>
+              <label class="capital-ratio-control" for="capitalRatioInput">
+                <span>1회 매수 자산 비율</span>
+                <strong id="capitalRatioValue">10%</strong>
+              </label>
+              <input id="capitalRatioInput" type="range" min="1" max="50" step="1" value="10" aria-label="1회 매수 자산 비율" />
+              <small id="capitalRatioPreview">평가금액의 10% · 가용 현금 한도 적용</small>
               <button id="recommendationButton" class="button button-primary recommendation-button" type="button">추천 후보 찾기</button>
             </div>
           </div>
@@ -124,9 +130,9 @@
           <div class="strategy-grid">
             <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small>국내 보통주 · 시가총액 1조 원 이상</small></div>
             <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
-            <div><span>매수</span><strong>4시간봉 BB(6,2) 하단 3% 이내</strong><small>주봉·일봉 상승 방향을 먼저 확인</small></div>
+            <div><span>매수</span><strong>4시간봉 BB(6,2) 하단 3% 이내</strong><small>주봉·일봉 상승 방향을 먼저 확인, 주봉 스윙 전고점 5% 이내 제외</small></div>
             <div><span>매도</span><strong>4시간봉 상단 또는 터치 후 -2%</strong><small>평균 매입가 -3% 손절 · 수동 전량매도 가능</small></div>
-            <div><span>운영시간</span><strong>평일 09:00~15:30</strong><small>오전·오후 5분 간격 검색</small></div>
+            <div><span>&#47588;&#49688;&#32;&#49884;&#44036;</span><strong>&#54217;&#51068;&#32;&#48;&#57;&#58;&#48;&#48;&#126;&#49;&#48;&#58;&#48;&#48;&#44;&#32;&#49;&#50;&#58;&#48;&#48;&#126;&#49;&#52;&#58;&#48;&#48;&#44;&#32;&#49;&#54;&#58;&#48;&#48;&#126;&#50;&#48;&#58;&#48;&#48;</strong><small>&#50528;&#54532;&#53552;&#47560;&#53011;&#32;&#51088;&#46041;&#32;&#47588;&#49688;&#32;&#48143;&#32;&#52572;&#49888;&#32;&#44144;&#47000;&#32;&#48516;&#48393;&#32;&#54869;&#51064;</small></div>
             <div><span>자금관리</span><strong>최대 5종목</strong><small>1회 매수 비율 설정 · PAPER 전용</small></div>
             <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>
           </div>
@@ -208,7 +214,7 @@
               </table>
             </div>
             <p id="positionsEmpty" class="empty">아직 보유한 종목이 없습니다.</p>
-            <p class="muted">수동 전량매도 버튼을 직접 눌렀을 때만 목표가와 관계없이 현재 시세로 가상 청산합니다. 국내 종목 · 평일 09:00~15:30 · 당일 자동 재매수 제외</p>
+            <p class="muted">수동 전량매도는 평일 정규장 09:00~15:30 및 애프터마켓 16:00~20:00의 최신 거래 분봉이 있을 때 PAPER 청산합니다. 당일 자동 재매수 제외</p>
           </article>
 
           <article class="panel">

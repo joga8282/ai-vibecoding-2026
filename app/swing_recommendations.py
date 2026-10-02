@@ -41,7 +41,8 @@ async def build_swing_recommendations(engine):
                 for attempt in range(3):
                     try:
                         candles = await asyncio.wait_for(engine.toss_client.candles(symbol, '1d', 100), timeout=10)
-                        return candles, trend_context(candles, quote_map[symbol].price, auto.clock())
+                        weekly = await asyncio.wait_for(engine.candles(symbol, '1w', 60), timeout=20)
+                        return candles, weekly, trend_context(candles, quote_map[symbol].price, auto.clock(), weekly)
                     except (URLError, TimeoutError) as exc:
                         if attempt == 2 or (isinstance(exc, HTTPError) and exc.code not in (429, 500, 502, 503, 504)):
                             raise
@@ -49,23 +50,23 @@ async def build_swing_recommendations(engine):
 
     daily_results = await asyncio.gather(*(daily_context(s) for s in eligible), return_exceptions=True)
 
-    async def finish_signal(symbol, daily, context):
+    async def finish_signal(symbol, daily, weekly, context):
         if not context.get('context_eligible'):
-            return swing_signal(daily, quote_map[symbol].price, auto.clock(), [])
+            return swing_signal(daily, quote_map[symbol].price, auto.clock(), [], weekly)
         # Toss exposes 1-minute and daily candles. engine.candles builds 4h session bars.
         # Only trend-qualified symbols pay this heavier lookup cost.
         async with asyncio.timeout_at(deadline):
             async with semaphore:
                 four_hour = await asyncio.wait_for(engine.candles(symbol, '4h', 10), timeout=40)
-        return swing_signal(daily, quote_map[symbol].price, auto.clock(), four_hour)
+        return swing_signal(daily, quote_map[symbol].price, auto.clock(), four_hour, weekly)
 
     tasks = []
     for symbol, result in zip(eligible, daily_results):
         if isinstance(result, Exception):
             tasks.append(result)
         else:
-            daily, context = result
-            tasks.append(asyncio.create_task(finish_signal(symbol, daily, context)))
+            daily, weekly, context = result
+            tasks.append(asyncio.create_task(finish_signal(symbol, daily, weekly, context)))
     pending = [task for task in tasks if isinstance(task, asyncio.Task)]
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
@@ -88,6 +89,8 @@ async def build_swing_recommendations(engine):
                 'price', 'ma20', 'ma60', 'weekly_ma10', 'bollinger_lower', 'bollinger_upper',
                 'band_distance_percent', 'conditions_passed', 'conditions_total')})
         details.append(detail)
+        if signal.get('weekly_peak_excluded') or signal.get('weekly_peak_checked') is not True:
+            continue
         if failed:
             continue
         settings = engine.settings

@@ -15,6 +15,12 @@ def history(now):
     return [Candle(now - timedelta(days=70-i), D(100+i), D(101+i), D(99+i), D(100+i), D(1000), Currency.KRW) for i in range(70)]
 
 
+def weekly_source(now):
+    return [Candle(now - timedelta(days=440-i), D(100+i*D('.1')), D(101+i*D('.1')),
+                   D(99+i*D('.1')), D(100+i*D('.1')), D(1000), Currency.KRW)
+            for i in range(420)]
+
+
 class SignalTest(TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 28, 10, tzinfo=KST)
@@ -96,11 +102,13 @@ class SwingTest(IsolatedAsyncioTestCase):
     asyncTearDown = test_paper_trader.PaperTraderTest.asyncTearDown
 
     async def setup_swing(self):
-        self.now = datetime(2026, 9, 28, 10, tzinfo=KST)
+        self.now = datetime(2026, 9, 28, 9, 30, tzinfo=KST)
         self.price = D(145)
         self.daily = history(self.now)
         async def candles(symbol, interval, count):
             if interval == '1d':
+                if count >= 400:
+                    return weekly_source(self.now)
                 return self.daily
             if count <= 3:
                 return [Candle(self.now, self.price, self.price, self.price, self.price, D(1000), Currency.KRW)]
@@ -119,6 +127,19 @@ class SwingTest(IsolatedAsyncioTestCase):
         await self.auto.restore()
         await self.auto.prepare()
         self.engine.running = True
+
+    async def test_after_market_hours_allow_only_supported_session(self):
+        await self.setup_swing()
+        for hour, minute, expected in [
+            (15, 29, True), (15, 30, False), (15, 59, False),
+            (16, 0, True), (19, 59, True), (20, 0, False),
+        ]:
+            self.now = self.now.replace(hour=hour, minute=minute)
+            self.assertEqual(self.auto.market_open(), expected, (hour, minute))
+            self.assertEqual(self.auto.buy_window_open(), hour >= 16 and hour < 20)
+        self.now = self.now.replace(month=10, day=3, hour=17)  # Saturday
+        self.assertFalse(self.auto.market_open())
+        self.assertFalse(self.auto.buy_window_open())
 
     async def test_three_percent_stop_loss(self):
         await self.setup_swing()
@@ -181,18 +202,25 @@ class SwingTest(IsolatedAsyncioTestCase):
 
     async def test_market_hours_stale_quotes_and_kill_switch_block_orders(self):
         await self.setup_swing()
-        for value in [self.now.replace(hour=8), self.now.replace(hour=16), self.now + timedelta(days=5)]:
+        for value in [self.now.replace(hour=8), self.now.replace(hour=15, minute=45), self.now + timedelta(days=5)]:
             self.now = value
             await self.auto.tick()
         self.assertFalse(self.broker.orders)
-        self.now = datetime(2026, 9, 28, 10, tzinfo=KST)
+        self.now = datetime(2026, 9, 28, 16, tzinfo=KST)
+        self.assertTrue(self.auto.market_open())
+        self.assertTrue(self.auto.buy_window_open())
         self.engine.kill_switch = True
         await self.auto.tick()
         self.assertFalse(self.broker.orders)
         self.engine.kill_switch = False
+        fresh_quote = self.auto.quote
         self.auto.quote = AsyncMock(side_effect=RuntimeError('stale quote'))
         await self.auto.tick()
         self.assertFalse(self.broker.orders)
+        self.auto.quote = fresh_quote
+        self.auto.next_scan = datetime.min.replace(tzinfo=KST)
+        await self.auto.tick()
+        self.assertEqual([order.side for order in self.broker.orders], [Side.BUY])
 
     async def test_recommendations_use_theme_universe_and_daily_signal(self):
         await self.setup_swing()
@@ -249,8 +277,8 @@ class SwingTest(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, '2개 이상'):
             await self.auto.test_buy('005930')
         self.daily = history(self.now)
-        self.now = self.now.replace(hour=16)
-        with self.assertRaisesRegex(RuntimeError, '09:00'):
+        self.now = self.now.replace(hour=15, minute=45)
+        with self.assertRaisesRegex(RuntimeError, '16:00'):
             await self.auto.test_buy('005930')
 
     async def test_pending_intent_is_not_reordered_after_restart(self):
@@ -270,6 +298,13 @@ class SwingTest(IsolatedAsyncioTestCase):
         async def candles(symbol, interval, count):
             if symbol == '000660':
                 raise TimeoutError('slow')
+            if interval == '1d' and count >= 400:
+                return weekly_source(self.now)
+            if interval == '1m':
+                values = [D(150 + i * 2) for i in range(10)] + [D(150), D(148)]
+                return [Candle((self.now - timedelta(days=6-i//2)).replace(hour=9 if i % 2 == 0 else 13),
+                               value, value, value, value, D(1000), Currency.KRW)
+                        for i, value in enumerate(values)]
             return self.daily
         self.engine.toss_client.candles.side_effect = candles
         with patch('app.swing_recommendations.load_universe', return_value=(D('1e12'), {'005930': ['테마'], '000660': ['테마']})):
@@ -356,9 +391,12 @@ class SwingTest(IsolatedAsyncioTestCase):
             await self.auto.manual_close('005930')
         self.engine.kill_switch = False
         self.now = self.now.replace(hour=16)
-        with self.assertRaisesRegex(RuntimeError, '09:00'):
+        self.auto.next_scan = datetime.min.replace(tzinfo=KST)
+        await self.auto.tick()
+        self.assertIn('005930', self.broker.positions)
+        self.auto.quote = AsyncMock(side_effect=RuntimeError('stale after-hours quote'))
+        with self.assertRaisesRegex(RuntimeError, 'stale after-hours quote'):
             await self.auto.manual_close('005930')
-        self.now = self.now.replace(hour=10)
         self.auto.quote = AsyncMock(side_effect=RuntimeError('시세 없음'))
         with self.assertRaisesRegex(RuntimeError, '시세 없음'):
             await self.auto.manual_close('005930')
@@ -396,7 +434,7 @@ class SwingTest(IsolatedAsyncioTestCase):
         await self.auto.tick()
         self.assertFalse(self.broker.orders)
         self.assertEqual(self.auto.session['outcome'], '매수 조건 대기')
-        self.now = self.now.replace(hour=14)
+        self.now = self.now.replace(hour=13, minute=59)
         self.price = D(145)
         await self.auto.tick()
         self.assertEqual([o.side for o in self.broker.orders], [Side.BUY])
@@ -407,12 +445,12 @@ class SwingTest(IsolatedAsyncioTestCase):
 
     async def test_start_in_afternoon_and_stop_at_market_close(self):
         await self.setup_swing()
-        self.now = self.now.replace(hour=15, minute=29)
+        self.now = self.now.replace(hour=16, minute=0)
         await self.auto.prepare()
         self.assertTrue(self.auto.status()['market_open'])
         await self.auto.tick()
         self.assertEqual(len(self.broker.orders), 1)
-        self.now = self.now.replace(minute=35)
+        self.now = self.now.replace(hour=20, minute=0)
         self.price = D(180)
         await self.auto.tick()
         self.assertEqual(len(self.broker.orders), 1)
@@ -426,7 +464,7 @@ class SwingTest(IsolatedAsyncioTestCase):
         self.auto.session['outcome'] = '진입 없음'
         self.auto.session['attempted'] = True
         self.auto.session['diagnostics'] = {'legacy_untracked': True}
-        self.now = self.now.replace(hour=14)
+        self.now = self.now.replace(hour=13, minute=59)
         await self.auto.tick()
         self.assertEqual(len(self.broker.orders), 1)
         self.assertFalse(self.auto.diagnostics()['legacy_untracked'])

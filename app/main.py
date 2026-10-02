@@ -417,6 +417,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=502, detail="PAPER 테스트 매수를 완료하지 못했습니다.") from exc
         return {"order": serialize(order), "message": "PAPER 테스트 1주 매수 완료"}
 
+    @app.post("/api/v1/paper/qualified-buy/{symbol}")
+    async def qualified_buy(symbol: str, request: Request) -> dict:
+        engine = get_engine(request)
+        try:
+            order = await engine.automation.buy_qualified(symbol.strip().upper())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).warning("PAPER qualified buy failed: %s", exc)
+            raise HTTPException(status_code=502, detail="조건 통과 종목 매수를 완료하지 못했습니다.") from exc
+        return {"order": serialize(order), "message": "자산 비율 PAPER 매수 완료"}
+
     @app.get("/api/v1/market/candles")
     async def market_candles(
         request: Request,

@@ -186,6 +186,10 @@ function renderCapital(account, risk, status, performance) {
   const ratioPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(tradeRatio * 100);
   $("#investmentRatioInput").value = String(Math.round(tradeRatio * 100));
   $("#investmentRatioValue").textContent = `${ratioPercent}%`;
+  $("#capitalRatioInput").value = String(Math.round(tradeRatio * 100));
+  $("#capitalRatioInput").disabled = !isPaper;
+  $("#capitalRatioValue").textContent = `${ratioPercent}%`;
+  $("#capitalRatioPreview").textContent = `${money(Math.min(availableCash, accountAmount * tradeRatio), "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
   $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
   $("#capitalMode").textContent = isPaper ? "PAPER" : "REAL";
@@ -228,6 +232,7 @@ function renderRecommendations(payload) {
         </div>
         <p class="recommendation-reason">${escapeHtml(item.reason)}</p>
         <div class="recommendation-quantity">종목별 배분·주문 한도 적용 시 최대 ${number(item.quantity, "KRW")}주</div>
+        <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>&#51312;&#44148;&#32;&#53685;&#44284;&#32;&#51333;&#47785;&#32;&#51088;&#49328;&#32;&#48708;&#50984;&#32;&#47588;&#49688;</button>
       </article>`).join("")
     : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
   const watchlist = payload.watchlist || [];
@@ -540,6 +545,27 @@ $("#investmentSettingsButton").addEventListener("click", () => {
 });
 $("#investmentRatioInput").addEventListener("input", event => {
   $("#investmentRatioValue").textContent = `${event.currentTarget.value}%`;
+  $("#capitalRatioInput").value = event.currentTarget.value;
+  previewInvestmentRatio(event.currentTarget.value);
+});
+$("#capitalRatioInput").addEventListener("input", event => {
+  const percent = event.currentTarget.value;
+  $("#capitalRatioValue").textContent = `${percent}%`;
+  $("#investmentRatioInput").value = percent;
+  $("#investmentRatioValue").textContent = `${percent}%`;
+  previewInvestmentRatio(percent);
+});
+$("#capitalRatioInput").addEventListener("change", async event => {
+  const slider = event.currentTarget;
+  slider.disabled = true;
+  try {
+    await saveInvestmentRatio(Number(slider.value));
+    toast(`1회 매수 비율을 ${slider.value}%로 저장했습니다.`);
+    await loadAll(true);
+  } catch (error) {
+    toast(error.message, true);
+    await loadAll(true);
+  }
 });
 $("#investmentSettingsClose").addEventListener("click", () => investmentSettingsDialog.close());
 $("#investmentSettingsCancel").addEventListener("click", () => investmentSettingsDialog.close());
@@ -549,10 +575,7 @@ $("#investmentSettingsForm").addEventListener("submit", async event => {
   saveButton.disabled = true;
   try {
     const ratioPercent = Number($("#investmentRatioInput").value);
-    await request(`${API}/settings/investment-ratio`, {
-      method: "PUT",
-      body: JSON.stringify({ ratio_percent: ratioPercent }),
-    });
+    await saveInvestmentRatio(ratioPercent);
     investmentSettingsDialog.close();
     toast(`1회 매수 비율을 ${ratioPercent}%로 저장했습니다.`);
     await loadAll(true);
@@ -562,6 +585,20 @@ $("#investmentSettingsForm").addEventListener("submit", async event => {
     saveButton.disabled = false;
   }
 });
+
+function previewInvestmentRatio(percent) {
+  const equity = Number(state.performance?.by_currency?.KRW?.current_equity || state.account?.total_equity?.KRW || 0);
+  const cash = Number(state.account?.cash?.KRW || 0);
+  const amount = Math.min(cash, equity * Number(percent) / 100);
+  $("#capitalRatioPreview").textContent = `${money(amount, "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
+}
+
+async function saveInvestmentRatio(ratioPercent) {
+  await request(`${API}/settings/investment-ratio`, {
+    method: "PUT",
+    body: JSON.stringify({ ratio_percent: ratioPercent }),
+  });
+}
 
 $("#positionsTable").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-close-position]");
@@ -580,6 +617,24 @@ $("#positionsTable").addEventListener("click", async (event) => {
     await loadAll(true);
     closingPositions.delete(symbol);
     if (state.account) renderPositions(state.account.positions);
+  }
+});
+
+$("#recommendationList").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-qualified-buy]");
+  if (!button || button.disabled) return;
+  const symbol = button.dataset.qualifiedBuy;
+  if (!confirm(`${symbol}: 매수 조건을 다시 확인하고 설정된 자산 비율로 PAPER 매수할까요?`)) return;
+  button.disabled = true;
+  button.textContent = "PAPER 매수 중...";
+  try {
+    await request(`${API}/paper/qualified-buy/${encodeURIComponent(symbol)}`, { method: "POST" });
+    toast(`${symbol} PAPER 매수 완료`);
+    await loadAll(true);
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+    button.textContent = "\uC870\uAC74 \uD1B5\uACFC \uC885\uBAA9 \uC790\uC0B0 \uBE44\uC728 \uB9E4\uC218";
   }
 });
 

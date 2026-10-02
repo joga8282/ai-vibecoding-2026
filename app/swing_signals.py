@@ -35,7 +35,7 @@ def _completed_four_hour(candles, now):
     return sorted((c for c in candles if _four_hour_end(c.timestamp) <= now.astimezone(KST)), key=lambda c: c.timestamp)
 
 
-def trend_context(candles, price, now):
+def trend_context(candles, price, now, weekly_candles=None):
     """Return weekly/daily context and daily exit levels without intraday data."""
     daily = _completed_daily(candles, now)
     invalid = (not price.is_finite() or price <= 0 or
@@ -47,14 +47,42 @@ def trend_context(candles, price, now):
     ma20, ma60 = _average(closes[-20:]), _average(closes[-60:])
     prev20 = _average(closes[-25:-5])
     daily_uptrend = ma20 > ma60 or (price >= ma60 and ma20 > prev20)
-    weekly = _completed_weekly(daily, now)
+    if weekly_candles is None:
+        weekly = _completed_weekly(daily, now)
+    else:
+        current_week = now.astimezone(KST).date().isocalendar()[:2]
+        weekly = sorted((c for c in weekly_candles
+                         if c.timestamp.astimezone(KST).date().isocalendar()[:2] != current_week),
+                        key=lambda c: c.timestamp)
     weekly_closes = [c.close_price for c in weekly]
     if len(weekly_closes) < 10:
         return {'context_eligible': False, 'sell': False, 'rejection_reasons': ['완료 주봉 데이터 부족'],
                 'conditions_passed': int(daily_uptrend), 'conditions_total': 3}
+    if weekly_candles is not None and len(weekly) < 52:
+        return {'context_eligible': False, 'sell': False,
+                'rejection_reasons': ['52주 전고점 확인에 필요한 완료 주봉 데이터 부족'],
+                'conditions_passed': int(daily_uptrend), 'conditions_total': 3}
     weekly_ma10 = _average(weekly_closes[-10:])
     previous_weekly_ma10 = _average(weekly_closes[-11:-1]) if len(weekly_closes) >= 11 else weekly_ma10
     weekly_uptrend = weekly_closes[-1] >= weekly_ma10 or weekly_ma10 > previous_weekly_ma10
+    weekly_window = weekly[-52:]
+    weekly_peak_high = max(c.high_price for c in weekly_window)
+    # A confirmed weekly swing high has two completed weeks on both sides.
+    # Find the nearest overhead pivot, which catches recent local resistance
+    # even when price is well below the 52-week absolute high.
+    swing_highs = [
+        weekly_window[index].high_price
+        for index in range(2, len(weekly_window) - 2)
+        if weekly_window[index].high_price >= max(
+            c.high_price for c in weekly_window[index - 2:index] + weekly_window[index + 1:index + 3]
+        )
+    ]
+    overhead_highs = [high for high in [*swing_highs, weekly_peak_high] if high >= price]
+    weekly_resistance_high = min(overhead_highs) if overhead_highs else D(0)
+    weekly_peak_excluded = (weekly_resistance_high > 0 and
+                            price >= weekly_resistance_high * D('0.95'))
+    weekly_peak_distance = ((weekly_resistance_high - price) / weekly_resistance_high * D(100)
+                            if weekly_resistance_high > 0 else D(100))
     std = (_average([(c - ma20) ** 2 for c in closes[-20:]])).sqrt()
     daily_lower, daily_upper = ma20 - D(2) * std, ma20 + D(2) * std
     reasons = []
@@ -62,18 +90,24 @@ def trend_context(candles, price, now):
         reasons.append('주봉 MA10 상승 추세 미충족')
     if not daily_uptrend:
         reasons.append('일봉 상승 추세 미충족')
-    return {'context_eligible': weekly_uptrend and daily_uptrend,
+    if weekly_peak_excluded:
+        reasons.append('최근 주봉 스윙 전고점 5% 이내 고점 구간')
+    return {'context_eligible': weekly_uptrend and daily_uptrend and not weekly_peak_excluded,
             'sell': std > 0 and price >= daily_upper,
             'weekly_uptrend': weekly_uptrend, 'daily_uptrend': daily_uptrend,
             'ma_alignment': ma20 > ma60, 'ma20_rising': ma20 > prev20,
             'weekly_ma10': str(weekly_ma10), 'ma20': str(ma20), 'ma60': str(ma60),
+            'weekly_peak_high': str(weekly_peak_high),
+            'weekly_resistance_high': str(weekly_resistance_high),
+            'weekly_peak_distance_percent': str(weekly_peak_distance.quantize(D('.01'))),
+            'weekly_peak_excluded': weekly_peak_excluded, 'weekly_peak_checked': True,
             'daily_bollinger_lower': str(daily_lower), 'daily_bollinger_upper': str(daily_upper),
             'price': str(price), 'conditions_passed': int(weekly_uptrend) + int(daily_uptrend),
             'conditions_total': 3, 'signal_at': daily[-1].timestamp.isoformat(),
             'rejection_reasons': reasons}
 
 
-def swing_signal(daily_candles, price, now, four_hour_candles=None):
+def swing_signal(daily_candles, price, now, four_hour_candles=None, weekly_candles=None):
     """Buy near the 4h lower band in weekly/daily uptrends; sell at the daily upper band."""
     # Keep the former three-argument API for integrations that only request daily analysis.
     if four_hour_candles is None:
@@ -99,7 +133,7 @@ def swing_signal(daily_candles, price, now, four_hour_candles=None):
                 'band_distance_percent': str(((price / lower - D(1)) * 100).quantize(D('.01'))),
                 'conditions_passed': passed, 'conditions_total': 3, 'rejection_reasons': [],
                 'score': 100 if alignment and rising and touched else passed * 30}
-    context = trend_context(daily_candles, price, now)
+    context = trend_context(daily_candles, price, now, weekly_candles)
     bars = _completed_four_hour(four_hour_candles or [], now)
     period = 6
     if len(bars) < period:

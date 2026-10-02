@@ -42,6 +42,7 @@ class TradingEngine:
         self._lifecycle_lock = asyncio.Lock()
         self._buy_candles: dict[str, tuple[datetime, list[Candle]]] = {}
         self._four_hour_candles: dict[str, tuple[datetime, list[Candle]]] = {}
+        self._weekly_candles: dict[str, tuple[datetime, list[Candle]]] = {}
         self.buy_filter_status: dict[str, str] = {}
         self._stock_names: dict[str, tuple[datetime, str | None]] = {}
         self._stock_names_lock = asyncio.Lock()
@@ -166,6 +167,13 @@ class TradingEngine:
             cached = self._four_hour_candles.get(symbol)
             if cached and now - cached[0] < timedelta(minutes=4) and len(cached[1]) >= count:
                 return cached[1][-count:]
+        elif interval == "1w":
+            cached = self._weekly_candles.get(symbol)
+            # Completed-week analysis does not need another multi-page daily
+            # history fetch on every five-minute scan. Refresh the history
+            # during the session, while still picking up a newly completed week.
+            if cached and now - cached[0] < timedelta(hours=6) and len(cached[1]) >= count:
+                return cached[1][-count:]
         minute_intervals = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "50m": 50, "60m": 60, "4h": 240}
         base_interval = "1m" if interval in minute_intervals else "1d"
         if interval == base_interval:
@@ -185,6 +193,14 @@ class TradingEngine:
             source_count = 200
         if self.toss_client:
             source = await self.toss_client.candles(symbol, base_interval, source_count)
+            if interval == "4h":
+                # After-hours prices may drive fresh PAPER exits, but they must
+                # not be folded into a regular-session four-hour candle.
+                source = [
+                    candle for candle in source
+                    if candle.currency is not Currency.KRW
+                    or time(9) <= candle.timestamp.astimezone(timezone(timedelta(hours=9))).time() < time(15, 30)
+                ]
         else:
             history = self.quote_history.get(symbol, [])[-source_count:]
             source = [
@@ -204,6 +220,8 @@ class TradingEngine:
         result = self._aggregate_candles(source, interval)[-count:]
         if interval == "4h":
             self._four_hour_candles[symbol] = (now, result)
+        elif interval == "1w":
+            self._weekly_candles[symbol] = (now, result)
         return result
 
     @staticmethod
