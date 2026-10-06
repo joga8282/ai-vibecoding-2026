@@ -97,8 +97,14 @@ class TradingEngine:
                 return
             if self.kill_switch:
                 raise RuntimeError("킬 스위치가 활성화되어 있습니다.")
-            if self.settings.mode != "paper":
-                raise RuntimeError("가상계좌 PAPER 주문만 지원합니다.")
+            if self.settings.mode == "live":
+                broker = self.broker
+                if not self.settings.live_trading_enabled or not getattr(broker, "risk", None):
+                    raise RuntimeError("LIVE order execution is disabled.")
+                if not broker.risk.armed or not broker.reconciled:
+                    raise RuntimeError("Reconcile and manually arm LIVE before starting automation.")
+            elif self.settings.mode != "paper":
+                raise RuntimeError("Unknown trader mode.")
             if self.automation:
                 await self.automation.prepare()
             if self.kill_switch:
@@ -150,11 +156,16 @@ class TradingEngine:
     async def lookup_quote(self, symbol: str) -> Quote:
         symbol = symbol.upper()
         if self.toss_client:
-            quotes = await self.toss_client.prices([symbol])
-            if not quotes:
-                raise LookupError(symbol)
-            self.set_quote(quotes[0])
-            return quotes[0]
+            if (self.settings.mode == 'live'
+                    and getattr(self.toss_client, 'requires_orderbook_snapshot', False) is True):
+                quote = await self.toss_client.live_quote(symbol)
+            else:
+                quotes = await self.toss_client.prices([symbol])
+                if not quotes:
+                    raise LookupError(symbol)
+                quote = quotes[0]
+            self.set_quote(quote)
+            return quote
         quote = self.quotes.get(symbol)
         if not quote:
             raise LookupError(symbol)
@@ -389,12 +400,22 @@ class TradingEngine:
         )
 
     def status(self) -> dict:
+        broker = self.broker
+        live_readiness = None
+        if self.settings.mode == "live":
+            live_readiness = {
+                "reconciled": bool(getattr(broker, "reconciled", False)),
+                "armed": bool(getattr(getattr(broker, "risk", None), "armed", False)),
+                "last_sync_at": (broker.last_sync_at.isoformat()
+                                 if getattr(broker, "last_sync_at", None) else None),
+            }
         return {
             "version": self.settings.version,
             "mode": self.settings.mode,
             "running": self.running,
             "kill_switch": self.kill_switch,
             "market_data": "toss" if self.toss_client else "manual",
+            "live_readiness": live_readiness,
             "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
             "last_error": self.last_error,
             "strategy_count": len(self.strategies),

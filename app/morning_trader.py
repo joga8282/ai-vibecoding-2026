@@ -108,7 +108,8 @@ class MorningTrader(PaperAutoTrader):
 
     def daily_orders(self, day):
         prefix = f"auto-{day['id']}-"
-        return [o for o in self.engine.broker.orders if o.client_order_id.startswith(prefix) and o.status is OrderStatus.FILLED]
+        return [o for o in self.engine.broker.orders if o.client_order_id.startswith(prefix)
+                and o.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)]
 
     async def quote(self, symbol):
         bars = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1m', 3), timeout=10)

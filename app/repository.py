@@ -171,37 +171,56 @@ class SnapshotRepository:
                 )
 
     async def save_live_account_snapshot(self, account_ref: str, holdings: list[dict],
-                                         orders: list[dict], captured_at: str) -> None:
-        await asyncio.to_thread(self._save_live_account_snapshot_sync, account_ref, holdings, orders, captured_at)
+                                         orders: list[dict], captured_at: str,
+                                         reconciled: bool = True, detail: str | None = None) -> None:
+        await asyncio.to_thread(self._save_live_account_snapshot_sync, account_ref, holdings,
+                                 orders, captured_at, reconciled, detail)
 
-    def _save_live_account_snapshot_sync(self, account_ref, holdings, orders, captured_at):
+    def _save_live_account_snapshot_sync(self, account_ref, holdings, orders, captured_at,
+                                         reconciled=True, detail=None):
         encoded_holdings = json.dumps(holdings, ensure_ascii=False, separators=(',', ':'))
         encoded_orders = json.dumps(orders, ensure_ascii=False, separators=(',', ':'))
         with closing(sqlite3.connect(self.path)) as connection:
             with connection:
                 connection.execute("INSERT INTO account_snapshots(account_ref,captured_at,holdings,orders) VALUES(?,?,?,?)",
                                    (account_ref, captured_at, encoded_holdings, encoded_orders))
-                connection.execute("INSERT INTO broker_accounts(account_ref,mode,last_sync_at,status) VALUES(?, 'live-readonly', ?, 'SYNCED') "
+                status = 'SYNCED' if reconciled else 'MISMATCH'
+                connection.execute("INSERT INTO broker_accounts(account_ref,mode,last_sync_at,status) VALUES(?, 'live-readonly', ?, ?) "
                                    "ON CONFLICT(account_ref) DO UPDATE SET last_sync_at=excluded.last_sync_at,status=excluded.status",
-                                   (account_ref, captured_at))
-                connection.execute("DELETE FROM live_positions WHERE account_ref=?", (account_ref,))
-                for item in holdings:
-                    symbol = item.get('symbol') or item.get('stock', {}).get('symbol')
-                    if not symbol:
-                        continue
-                    connection.execute("INSERT INTO live_positions(account_ref,symbol,name,quantity,average_price,market_price,market_value,profit_loss,synced_at) "
-                                       "VALUES(?,?,?,?,?,?,?,?,?)",
-                                       (account_ref, symbol, item.get('name'), str(item.get('quantity', '0')),
-                                        str(item.get('averagePrice') or item.get('average_price') or ''),
-                                        str(item.get('marketPrice') or item.get('market_price') or ''),
-                                        str(item.get('marketValue') or item.get('market_value') or ''),
-                                        str(item.get('profitLoss') or item.get('profit_loss') or ''), captured_at))
-                connection.execute("INSERT INTO reconciliation_events(account_ref,reconciled,detail,created_at) VALUES(?,1,?,?)",
-                                   (account_ref, f'holdings={len(holdings)},orders={len(orders)}', captured_at))
+                                   (account_ref, captured_at, status))
+                if reconciled:
+                    connection.execute("DELETE FROM live_positions WHERE account_ref=?", (account_ref,))
+                    for item in holdings:
+                        stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                        symbol = item.get('symbol') or stock.get('symbol')
+                        if not symbol:
+                            continue
+                        connection.execute("INSERT INTO live_positions(account_ref,symbol,name,quantity,average_price,market_price,market_value,profit_loss,synced_at) "
+                                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                                           (account_ref, str(symbol).upper(), item.get('name') or stock.get('name'), str(item.get('quantity', '0')),
+                                            str(item.get('averagePurchasePrice') or item.get('averagePrice') or item.get('average_price') or ''),
+                                            str(item.get('lastPrice') or item.get('marketPrice') or item.get('market_price') or ''),
+                                            str(item.get('marketValue') or item.get('market_value') or ''),
+                                            str(item.get('profitLoss') or item.get('profit_loss') or ''), captured_at))
+                event_detail = detail or f'holdings={len(holdings)},orders={len(orders)}'
+                connection.execute("INSERT INTO reconciliation_events(account_ref,reconciled,detail,created_at) VALUES(?,?,?,?)",
+                                   (account_ref, int(reconciled), event_detail, captured_at))
 
     async def append_reconciliation_event(self, account_ref: str, reconciled: bool,
                                           detail: str, created_at: str) -> None:
         await asyncio.to_thread(self._append_reconciliation_event_sync, account_ref, reconciled, detail, created_at)
+
+    async def append_risk_event(self, symbol: str | None, rule: str, allowed: bool, detail: str) -> None:
+        await asyncio.to_thread(self._append_risk_event_sync, symbol, rule, allowed, detail)
+
+    def _append_risk_event_sync(self, symbol, rule, allowed, detail):
+        from datetime import datetime, timezone
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute(
+                    "INSERT INTO risk_events(symbol,rule,allowed,detail,created_at) VALUES(?,?,?,?,?)",
+                    (symbol, rule, int(allowed), detail, datetime.now(timezone.utc).isoformat()),
+                )
 
     def _append_reconciliation_event_sync(self, account_ref, reconciled, detail, created_at):
         with closing(sqlite3.connect(self.path)) as connection:

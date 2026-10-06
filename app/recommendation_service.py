@@ -9,18 +9,42 @@ from app.recommendations import analyze_candidate
 from app.swing_recommendations import build_swing_recommendations
 
 
+def _remember_live_recommendations(engine, result: dict) -> None:
+    risk = getattr(engine.broker, 'risk', None)
+    if engine.settings.mode != 'live' or risk is None:
+        return
+    candidates = result.get('candidates') if isinstance(result, dict) else None
+    risk.set_recommended_symbols(
+        candidate.get('symbol') for candidate in (candidates or [])
+        if isinstance(candidate, dict) and candidate.get('eligible') is True
+        and candidate.get('currency', 'KRW') == 'KRW'
+    )
+
+
 async def build_recommendations(engine, report_direction="neutral") -> dict:
     if str(getattr(engine.automation, 'strategy', '')).startswith('swing-v'):
         try:
             result = await build_swing_recommendations(engine)
         except Exception as exc:
+            risk = getattr(engine.broker, 'risk', None)
+            if risk:
+                risk.clear_recommended_symbols()
             engine.last_error = f"recommendations: {type(exc).__name__}: {exc}"
             raise HTTPException(status_code=502, detail="스윙 후보 조회 실패: 시세 API 연결과 설정을 확인하세요.") from exc
         if engine.last_error and engine.last_error.startswith('recommendations:'):
             engine.last_error = None
+        _remember_live_recommendations(engine, result)
         return result
     if getattr(engine.automation, 'strategy', None) == 'morning-v1':
-        return await build_morning_recommendations(engine)
+        try:
+            result = await build_morning_recommendations(engine)
+        except Exception:
+            risk = getattr(engine.broker, 'risk', None)
+            if risk:
+                risk.clear_recommended_symbols()
+            raise
+        _remember_live_recommendations(engine, result)
+        return result
     account = engine.broker.account(engine.quotes)
     equity = Decimal(account["total_equity"]["KRW"])
     cash = Decimal(account["cash"]["KRW"])
@@ -59,6 +83,9 @@ async def build_recommendations(engine, report_direction="neutral") -> dict:
             timeout=20,
         )
     except Exception as exc:
+        risk = getattr(engine.broker, 'risk', None)
+        if risk:
+            risk.clear_recommended_symbols()
         engine.last_error = f"recommendations: {type(exc).__name__}: {exc}"
         raise HTTPException(status_code=502, detail="추천 후보를 분석하지 못했습니다.") from exc
 
@@ -93,7 +120,7 @@ async def build_recommendations(engine, report_direction="neutral") -> dict:
         )
     random.shuffle(candidates)
     selected_candidates = candidates[:5]
-    return {
+    result = {
         "budget": str(budget.quantize(Decimal("1"))),
         "ratio": str(engine.settings.recommended_trade_ratio),
         "ranked_at": ranking_result.get("rankedAt"),
@@ -108,6 +135,8 @@ async def build_recommendations(engine, report_direction="neutral") -> dict:
         "candidates": selected_candidates,
         "disclaimer": "상승 추세·과열 제외·저항 여력과 지지선 또는 볼린저 하단 접촉 조건을 통과한 PAPER 후보입니다. 조건에 맞는 종목만 최대 5개 표시하며 투자 권유가 아닙니다.",
     }
+    _remember_live_recommendations(engine, result)
+    return result
 
 
 async def build_morning_recommendations(engine):

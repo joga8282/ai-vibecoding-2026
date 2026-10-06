@@ -61,7 +61,12 @@ class PaperAutoTrader:
         return {"budget": str(budget), "spent": str(self.spent()), "remaining": str(max(Decimal("0"), budget - self.spent())), "message": self.message, "targets": list(self.session["targets"].values()) if self.session else []}
 
     def active(self):
-        return self.engine.running and not self.engine.kill_switch and self.engine.settings.mode == "paper"
+        live_ready = (self.engine.settings.mode == "live"
+                      and self.engine.settings.live_trading_enabled
+                      and getattr(self.engine.broker, 'risk', None)
+                      and self.engine.broker.risk.armed
+                      and self.engine.broker.reconciled)
+        return self.engine.running and not self.engine.kill_switch and (self.engine.settings.mode == "paper" or live_ready)
 
     async def quote(self, symbol):
         quotes = await asyncio.wait_for(self.engine.toss_client.prices([symbol]), timeout=10)

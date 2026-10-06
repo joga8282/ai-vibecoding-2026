@@ -24,6 +24,9 @@ class Side(StrEnum):
 
 class OrderStatus(StrEnum):
     FILLED = "FILLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    PENDING = "PENDING"
+    CANCELED = "CANCELED"
     REJECTED = "REJECTED"
 
 
@@ -34,6 +37,8 @@ class Quote:
     currency: Currency
     timestamp: datetime
     source: str = "manual"
+    bid_price: Decimal | None = None
+    ask_price: Decimal | None = None
 
 
 @dataclass(slots=True)

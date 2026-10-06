@@ -5,14 +5,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="/static/favicon.ico" type="image/ico">
-  <meta name="description" content="토스증권 시세 기반 가상자금 자동매매 대시보드">
+  <meta name="description" content="토스증권 계좌 및 시세 기반 자동매매 대시보드">
   <title>토스 주식 자동매매</title>
   <script>
     try { document.documentElement.dataset.theme = localStorage.getItem("trader-theme") || "dark"; }
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
   <link rel="stylesheet" href="/static/styles.css?v=0.3.8">
-  <script src="/static/app.js?v=0.7.5" defer></script>
+  <script src="/static/app.js?v=0.7.8" defer></script>
 </head>
 
 <body>
@@ -21,14 +21,14 @@
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">P</span>
         <div>
-          <p class="eyebrow">TOSS MARKET · PAPER ONLY</p>
+          <p class="eyebrow" id="marketEyebrow">TOSS MARKET · 연결 확인 중</p>
           <h1>토스 AI 주식매매</h1>
         </div>
       </div>
       <div class="topbar-actions">
         <button id="refreshAllButton" class="button status-button button-ghost" type="button">새로고침</button>
         <button id="tossConnectionButton" class="button status-button status-checking" type="button">API 확인 중</button>
-        <button id="tradingModeButton" class="button status-button status-paper" type="button" aria-label="현재 주문 모드">PAPER</button>
+        <button id="tradingModeButton" class="button status-button" type="button" aria-label="현재 주문 모드">모드 확인 중</button>
       </div>
     </header>
 
@@ -41,11 +41,12 @@
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
             <p id="autoBudgetStatus" class="muted">최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 추적 매도</p>
             <p class="muted">매수 신호 시 총평가금액의 설정 비율로 1회 일괄 매수 · 종목별 분할매수 없음</p>
-            <p class="muted">평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00 · 5분 간격 확인 · PAPER 주문</p>
+            <p class="muted" id="tradingHoursHelp">주문 모드 확인 중</p>
             <p class="muted">최대 5종목 보유 · 5종목이면 기존 매도 조건으로 자리가 날 때까지 신규 매수 대기</p>
           </div>
           <div class="control-row">
-            <button id="startButton" class="button button-primary" type="button">가상 자동매매 시작</button>
+            <button id="startButton" class="button button-primary" type="button" disabled>주문 모드 확인 중</button>
+            <button id="liveArmButton" class="button button-ghost" type="button" hidden>LIVE 계좌 동기화·무장</button>
             <button id="stopButton" class="button button-secondary" type="button">중지</button>
             <button id="investmentSettingsButton" class="button button-ghost" type="button">투자비율 설정</button>
           </div>
@@ -133,7 +134,7 @@
             <div><span>매수</span><strong>4시간봉 BB(6,2) 하단 3% 이내</strong><small>주봉·일봉 상승 방향을 먼저 확인, 주봉 스윙 전고점 5% 이내 제외</small></div>
             <div><span>매도</span><strong>4시간봉 상단 또는 터치 후 -2%</strong><small>평균 매입가 -3% 손절 · 수동 전량매도 가능</small></div>
             <div><span>&#47588;&#49688;&#32;&#49884;&#44036;</span><strong>&#54217;&#51068;&#32;&#48;&#57;&#58;&#48;&#48;&#126;&#49;&#48;&#58;&#48;&#48;&#44;&#32;&#49;&#50;&#58;&#48;&#48;&#126;&#49;&#52;&#58;&#48;&#48;&#44;&#32;&#49;&#54;&#58;&#48;&#48;&#126;&#50;&#48;&#58;&#48;&#48;</strong><small>&#50528;&#54532;&#53552;&#47560;&#53011;&#32;&#51088;&#46041;&#32;&#47588;&#49688;&#32;&#48143;&#32;&#52572;&#49888;&#32;&#44144;&#47000;&#32;&#48516;&#48393;&#32;&#54869;&#51064;</small></div>
-            <div><span>자금관리</span><strong>최대 5종목</strong><small>1회 매수 비율 설정 · PAPER 전용</small></div>
+            <div><span>자금관리</span><strong>최대 5종목</strong><small id="strategyCapitalHelp">투자비율 확인 중</small></div>
             <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>
           </div>
           <p class="muted">검색 결과에서 자동 매수 조건 통과 종목과 조건에 가까운 관찰 후보를 구분합니다. 관찰 후보는 자동 매수되지 않습니다.</p>
@@ -141,7 +142,7 @@
         <div id="recommendationResults" class="recommendation-results" hidden>
           <div class="recommendation-header">
             <div>
-              <p class="eyebrow">PAPER SCREENING</p>
+              <p class="eyebrow" id="screeningEyebrow">SCREENING</p>
               <h2>테마 스윙 매수 후보 TOP 5</h2>
             </div>
             <span id="recommendationBudget" class="badge badge-paper">-</span>
@@ -178,13 +179,13 @@
             <div class="panel-header">
               <div>
                 <p class="eyebrow">ACCOUNT</p>
-                <h2>가상계좌</h2>
+                <h2 id="accountHeading">가상계좌</h2>
               </div>
-              <span class="badge badge-paper">PAPER</span>
+              <span id="accountModeBadge" class="badge badge-paper">PAPER</span>
             </div>
             <div class="account-grid">
-              <div><span>KRW 현금</span><strong id="krwCash">-</strong></div>
-              <div><span>USD 현금</span><strong id="usdCash">-</strong></div>
+              <div><span id="krwCashLabel">KRW 현금</span><strong id="krwCash">-</strong></div>
+              <div><span id="usdCashLabel">USD 현금</span><strong id="usdCash">-</strong></div>
               <div><span>체결 주문</span><strong id="filledOrders">-</strong></div>
               <div><span>거부 주문</span><strong id="rejectedOrders">-</strong></div>
             </div>
@@ -214,7 +215,7 @@
               </table>
             </div>
             <p id="positionsEmpty" class="empty">아직 보유한 종목이 없습니다.</p>
-            <p class="muted">수동 전량매도는 평일 정규장 09:00~15:30 및 애프터마켓 16:00~20:00의 최신 거래 분봉이 있을 때 PAPER 청산합니다. 당일 자동 재매수 제외</p>
+            <p class="muted" id="manualCloseHelp">주문 모드와 계좌 동기화 상태를 확인한 뒤 수동 매도할 수 있습니다.</p>
           </article>
 
           <article class="panel">
@@ -282,9 +283,9 @@
         <p id="diagnosticLastScan" class="muted"></p>
       </section>
 
-      <section class="panel" aria-label="가상 스윙투자 누적 성과">
+      <section class="panel" aria-label="스윙투자 누적 성과">
         <h2>스윙투자 누적 성과</h2>
-        <p id="scalpSummary" class="muted">실제 가상 주문이 쌓이면 날짜별로 비교합니다.</p>
+        <p id="scalpSummary" class="muted">체결 기록이 쌓이면 날짜별로 비교합니다.</p>
         <div class="table-wrap"><table><thead><tr><th>날짜</th><th>상태</th><th>매수원가</th><th>실현손익</th><th>수익률</th></tr></thead><tbody id="scalpDays"></tbody></table></div>
         <p class="muted">수수료 포함 · 미청산은 수익률에서 제외 · 서버가 켜져 있어야 자동 청산됩니다.</p>
       </section>
@@ -313,7 +314,7 @@
           <div class="favorite-report-header"><h3>즐겨찾기</h3><button id="clearReportFavorites" class="text-button" type="button">전체 삭제</button></div>
           <div id="reportFavorites" class="favorite-list"><p class="empty">즐겨찾기한 이슈가 없습니다.</p></div>
         </div>
-        <p class="recommendation-disclaimer">뉴스 제목 기반 보조지표이며 투자 권유가 아닙니다. PAPER 추천 점수와 제안 수량에만 반영됩니다.</p>
+        <p class="recommendation-disclaimer">뉴스 제목 기반 보조지표이며 추천 점수와 제안 수량에 반영됩니다. 주문 전 매수 조건과 위험 한도를 다시 확인합니다.</p>
       </section>
     </main>
   </div>

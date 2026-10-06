@@ -96,6 +96,8 @@ async def build_swing_recommendations(engine):
         settings = engine.settings
         fill = quote.price * (1 + settings.slippage_bps / D(10000))
         quantity = int(remaining // (fill * (1 + settings.fee_rate)))
+        if settings.mode == 'live' and settings.live_max_order_amount_krw > 0:
+            quantity = min(quantity, int(settings.live_max_order_amount_krw // fill))
         item = {**signal, 'symbol': symbol, 'name': stock.get('name') or symbol,
                 'themes': themes[symbol], 'strategy': 'swing-v2-mtf-4h', 'currency': 'KRW',
                 'quantity': quantity, 'market_cap': str(quote.price * D(stock['sharesOutstanding']))}

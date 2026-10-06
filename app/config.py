@@ -55,9 +55,11 @@ class Settings:
     live_require_manual_arm: bool = True
     live_max_order_amount_krw: Decimal = Decimal("100000")
     live_max_total_exposure_krw: Decimal = Decimal("500000")
+    live_max_total_exposure_ratio: Decimal = Decimal("0.15")
     live_max_daily_loss_krw: Decimal = Decimal("50000")
     live_max_position_loss_percent: Decimal = Decimal("3")
     live_allowed_symbols: tuple[str, ...] = ()
+    live_symbol_policy: str = 'allowlist'
     api_access_token: str | None = None
 
     @classmethod
@@ -69,7 +71,7 @@ class Settings:
         recommended_trade_ratio = Decimal(
             os.getenv("RECOMMENDED_TRADE_RATIO", "0.10")
         )
-        if not Decimal("0") <= recommended_trade_ratio <= Decimal("1"):
+        if not recommended_trade_ratio.is_finite() or not Decimal("0") <= recommended_trade_ratio <= Decimal("1"):
             raise RuntimeError("RECOMMENDED_TRADE_RATIO는 0부터 1 사이여야 합니다.")
         database_path = Path(os.getenv(
             "LIVE_DATABASE_PATH" if mode == "live" else "DATABASE_PATH",
@@ -77,12 +79,35 @@ class Settings:
         ))
         account_seq = os.getenv("TOSS_ACCOUNT_SEQ") or None
         live_enabled = _as_bool(os.getenv("LIVE_TRADING_ENABLED"))
+        api_access_token = os.getenv("API_ACCESS_TOKEN") or None
+        live_limits = {
+            "LIVE_MAX_ORDER_AMOUNT_KRW": Decimal(os.getenv("LIVE_MAX_ORDER_AMOUNT_KRW", "100000")),
+            "LIVE_MAX_TOTAL_EXPOSURE_KRW": Decimal(os.getenv("LIVE_MAX_TOTAL_EXPOSURE_KRW", "500000")),
+            "LIVE_MAX_TOTAL_EXPOSURE_RATIO": Decimal(os.getenv("LIVE_MAX_TOTAL_EXPOSURE_RATIO", "0.15")),
+            "LIVE_MAX_DAILY_LOSS_KRW": Decimal(os.getenv("LIVE_MAX_DAILY_LOSS_KRW", "50000")),
+            "LIVE_MAX_POSITION_LOSS_PERCENT": Decimal(os.getenv("LIVE_MAX_POSITION_LOSS_PERCENT", "3")),
+        }
+        optional_caps = {'LIVE_MAX_ORDER_AMOUNT_KRW', 'LIVE_MAX_TOTAL_EXPOSURE_KRW'}
+        if any(not value.is_finite() or value < 0 or (value == 0 and key not in optional_caps)
+               for key, value in live_limits.items()):
+            raise RuntimeError("LIVE risk limits must be finite positive numbers; optional KRW caps may be zero.")
+        if live_limits["LIVE_MAX_POSITION_LOSS_PERCENT"] >= Decimal("100"):
+            raise RuntimeError("LIVE_MAX_POSITION_LOSS_PERCENT must be below 100.")
+        if live_limits["LIVE_MAX_TOTAL_EXPOSURE_RATIO"] > Decimal("1"):
+            raise RuntimeError("LIVE_MAX_TOTAL_EXPOSURE_RATIO cannot exceed 1 (100%).")
+        symbol_policy = os.getenv('LIVE_SYMBOL_POLICY', 'allowlist').strip().lower()
+        if symbol_policy not in {'allowlist', 'recommended'}:
+            raise RuntimeError('LIVE_SYMBOL_POLICY must be allowlist or recommended.')
         if mode == 'live' and not account_seq:
             raise RuntimeError("LIVE 읽기 전용 모드에는 TOSS_ACCOUNT_SEQ가 필요합니다.")
         if mode == 'live' and database_path == Path(os.getenv("DATABASE_PATH", "data/auto_trader.db")):
             raise RuntimeError("LIVE_DATABASE_PATH는 PAPER DB와 달라야 합니다.")
-        if live_enabled:
-            raise RuntimeError("LIVE 주문 전송은 아직 잠겨 있습니다. LIVE_TRADING_ENABLED=false를 사용하세요.")
+        if live_enabled and mode != 'live':
+            raise RuntimeError("LIVE_TRADING_ENABLED=true requires TRADER_MODE=live.")
+        if live_enabled and not api_access_token:
+            raise RuntimeError("LIVE trading requires API_ACCESS_TOKEN to protect arming and order controls.")
+        if live_enabled and symbol_policy == 'allowlist' and not os.getenv('LIVE_ALLOWED_SYMBOLS', '').strip():
+            raise RuntimeError("LIVE trading requires an explicit LIVE_ALLOWED_SYMBOLS allowlist.")
         return cls(
             mode=mode,
             database_path=database_path,
@@ -103,10 +128,12 @@ class Settings:
             toss_account_seq=account_seq,
             live_trading_enabled=live_enabled,
             live_require_manual_arm=_as_bool(os.getenv("LIVE_REQUIRE_MANUAL_ARM"), default=True),
-            live_max_order_amount_krw=Decimal(os.getenv("LIVE_MAX_ORDER_AMOUNT_KRW", "100000")),
-            live_max_total_exposure_krw=Decimal(os.getenv("LIVE_MAX_TOTAL_EXPOSURE_KRW", "500000")),
-            live_max_daily_loss_krw=Decimal(os.getenv("LIVE_MAX_DAILY_LOSS_KRW", "50000")),
-            live_max_position_loss_percent=Decimal(os.getenv("LIVE_MAX_POSITION_LOSS_PERCENT", "3")),
+            live_max_order_amount_krw=live_limits["LIVE_MAX_ORDER_AMOUNT_KRW"],
+            live_max_total_exposure_krw=live_limits["LIVE_MAX_TOTAL_EXPOSURE_KRW"],
+            live_max_total_exposure_ratio=live_limits["LIVE_MAX_TOTAL_EXPOSURE_RATIO"],
+            live_max_daily_loss_krw=live_limits["LIVE_MAX_DAILY_LOSS_KRW"],
+            live_max_position_loss_percent=live_limits["LIVE_MAX_POSITION_LOSS_PERCENT"],
             live_allowed_symbols=tuple(filter(None, (s.strip().upper() for s in os.getenv("LIVE_ALLOWED_SYMBOLS", "").split(',')))),
-            api_access_token=os.getenv("API_ACCESS_TOKEN") or None,
+            live_symbol_policy=symbol_policy,
+            api_access_token=api_access_token,
         )

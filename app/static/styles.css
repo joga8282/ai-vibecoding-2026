@@ -317,6 +317,10 @@ h2 {
   transition: transform .15s, opacity .15s, background .15s;
 }
 
+.button[hidden] {
+  display: none;
+}
+
 .button:hover {
   transform: translateY(-1px);
 }

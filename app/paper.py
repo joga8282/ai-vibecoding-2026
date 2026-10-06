@@ -83,7 +83,7 @@ class PaperBroker:
     async def get_positions(self) -> list[dict]:
         return serialize(list(self.positions.values()))
 
-    async def get_buying_power(self, symbol: str | None = None) -> dict:
+    async def get_buying_power(self, currency: Currency = Currency.KRW) -> dict:
         return {'KRW': str(self.cash[Currency.KRW]), 'USD': str(self.cash[Currency.USD])}
 
     async def get_sellable_quantity(self, symbol: str) -> dict:

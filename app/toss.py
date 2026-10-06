@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator
@@ -14,11 +15,21 @@ from app.models import Candle, Currency, Quote, utc_now
 import websockets
 
 
+class TossAPIError(RuntimeError):
+    """Safe diagnostic for upstream HTTP failures; never includes response data."""
+
+    def __init__(self, status: int, path: str) -> None:
+        self.status = status
+        self.path = path
+        super().__init__(f"Toss API returned HTTP {status} for {path}.")
+
+
 class TossMarketClient:
     """Read-only Toss market client. This class intentionally has no order methods."""
 
     base_url = "https://openapi.tossinvest.com"
     websocket_url = "wss://openapi-ws.tossinvest.com/ws/v1"
+    requires_orderbook_snapshot = True
 
     def __init__(self, client_id: str, client_secret: str) -> None:
         self.client_id = client_id
@@ -62,6 +73,115 @@ class TossMarketClient:
             return []
         token = await self._access_token()
         return await asyncio.to_thread(self._prices_sync, token, symbols)
+
+    async def orderbook(self, symbol: str) -> dict:
+        token = await self._access_token()
+        query = urllib.parse.urlencode({"symbol": symbol.upper()})
+        path = "/api/v1/orderbook"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}?{query}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        for attempt in range(3):
+            try:
+                payload = await asyncio.to_thread(self._request_json_sync, request)
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
+                    exc.close()
+                    await asyncio.sleep(0.25 * (2 ** attempt))
+                    continue
+                status = exc.code
+                exc.close()
+                raise TossAPIError(status, path) from None
+        result = payload.get('result', payload)
+        if not isinstance(result, dict):
+            raise RuntimeError('Toss returned an invalid order book.')
+        return result
+
+    async def live_quote(self, symbol: str) -> Quote:
+        """Build a current indicative price from a fresh two-sided order book."""
+        book = await self.orderbook(symbol)
+        return self._quote_from_orderbook(symbol, book)
+
+    @staticmethod
+    def _quote_from_orderbook(symbol: str, book: dict) -> Quote:
+        try:
+            timestamp = datetime.fromisoformat(str(book['timestamp']).replace('Z', '+00:00'))
+            currency = Currency(book.get('currency', 'KRW'))
+            bids, asks = book['bids'], book['asks']
+            bid = Decimal(str(bids[0]['price']))
+            ask = Decimal(str(asks[0]['price']))
+            bid_volume = Decimal(str(bids[0]['volume']))
+            ask_volume = Decimal(str(asks[0]['volume']))
+        except (ArithmeticError, KeyError, TypeError, ValueError, IndexError) as exc:
+            raise RuntimeError('Toss returned an incomplete order book.') from exc
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise RuntimeError('Toss order book timestamp must include a timezone.')
+        if (currency is not Currency.KRW or not bid.is_finite() or not ask.is_finite()
+                or not bid_volume.is_finite() or not ask_volume.is_finite()
+                or bid <= 0 or ask <= 0 or bid >= ask
+                or bid_volume <= 0 or ask_volume <= 0):
+            raise RuntimeError('Toss returned an invalid two-sided KRW order book.')
+        return Quote(
+            symbol.upper(), (bid + ask) / Decimal(2), currency, timestamp,
+            source='toss', bid_price=bid, ask_price=ask,
+        )
+
+    async def live_quotes(self, symbols: list[str], *, timeout: float = 5.0) -> list[Quote]:
+        """Collect timestamped, real-time KR order-book updates on one socket."""
+        normalized = sorted(set(symbol.upper() for symbol in symbols))
+        if not normalized:
+            return []
+        if any(not (len(symbol) == 6 and symbol.isdigit()) for symbol in normalized):
+            raise ValueError('Toss KR order-book stream requires six-digit symbols.')
+        token = await self._access_token()
+        topics = {f'orderbook:kr:{symbol}': symbol for symbol in normalized}
+        request_id = 'risk-orderbook'
+        received: dict[str, Quote] = {}
+        async with websockets.connect(
+            self.websocket_url,
+            additional_headers={'Authorization': f'Bearer {token}'},
+            ping_interval=60,
+            ping_timeout=20,
+            close_timeout=5,
+        ) as socket:
+            await socket.send(json.dumps([
+                {'id': request_id},
+                {'type': 'orderbook:kr', 'codes': normalized},
+            ]))
+            deadline = time.monotonic() + timeout
+            while len(received) < len(normalized):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    missing = ','.join(sorted(set(normalized) - set(received)))
+                    raise RuntimeError(f'Toss real-time order book timed out for {missing}.')
+                raw_message = await asyncio.wait_for(socket.recv(), timeout=remaining)
+                if not isinstance(raw_message, str):
+                    continue
+                message = json.loads(raw_message)
+                if message.get('type') == 'error':
+                    error = message.get('error', {})
+                    raise RuntimeError(error.get('message') or error.get('code') or
+                                       'Toss WebSocket error')
+                if message.get('type') == 'subscriptions':
+                    subscribed = set(message.get('subscribed', []))
+                    rejected = message.get('rejected', [])
+                    expected = set(topics)
+                    if expected.issubset(subscribed):
+                        continue
+                    detail = ', '.join(str(item.get('message') or item.get('code') or item)
+                                       for item in rejected)
+                    raise RuntimeError('Toss rejected real-time order-book subscription' +
+                                       (f': {detail}' if detail else '.'))
+                if message.get('type') != 'message':
+                    continue
+                symbol = topics.get(message.get('topic'))
+                data = message.get('data')
+                if symbol is None or not isinstance(data, dict):
+                    continue
+                received[symbol] = self._quote_from_orderbook(symbol, data)
+        return [received[symbol] for symbol in normalized]
 
     async def stock_info(self, symbol: str) -> dict | None:
         normalized = symbol.upper()
@@ -130,18 +250,29 @@ class TossMarketClient:
         )
         return payload.get('result', payload)
 
+    async def _account_post(self, path: str, account_seq: str, body: dict):
+        token = await self._access_token()
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(body, separators=(",", ":")).encode(),
+            headers={"Authorization": f"Bearer {token}",
+                     "X-Tossinvest-Account": str(account_seq),
+                     "Content-Type": "application/json"},
+            method="POST",
+        )
+        payload = await asyncio.to_thread(self._request_json_sync, request)
+        return payload.get('result', payload)
+
     async def accounts(self) -> list[dict]:
         result = await self._account_get('/api/v1/accounts')
         return result if isinstance(result, list) else result.get('accounts', [])
 
-    async def holdings(self, account_seq: str) -> list[dict]:
+    async def holdings(self, account_seq: str) -> dict:
         result = await self._account_get('/api/v1/holdings', account_seq)
-        if isinstance(result, list):
-            return result
-        return result.get('holdings') or result.get('positions') or []
+        return result if isinstance(result, dict) else {'items': result}
 
-    async def buying_power(self, account_seq: str, symbol: str | None = None) -> dict:
-        result = await self._account_get('/api/v1/buying-power', account_seq, {'symbol': symbol})
+    async def buying_power(self, account_seq: str, currency: Currency = Currency.KRW) -> dict:
+        result = await self._account_get('/api/v1/buying-power', account_seq, {'currency': currency.value})
         return result if isinstance(result, dict) else {'items': result}
 
     async def sellable_quantity(self, account_seq: str, symbol: str) -> dict:
@@ -155,8 +286,18 @@ class TossMarketClient:
         return result.get('orders') or result.get('items') or []
 
     async def account_order(self, account_seq: str, order_id: str) -> dict:
-        result = await self._account_get(f'/api/v1/orders/{urllib.parse.quote(order_id)}', account_seq)
+        result = await self._account_get(
+            f'/api/v1/orders/{urllib.parse.quote(order_id, safe="")}', account_seq
+        )
         return result if isinstance(result, dict) else {'items': result}
+
+    async def create_order(self, account_seq: str, request: dict) -> dict:
+        return await self._account_post('/api/v1/orders', account_seq, request)
+
+    async def cancel_account_order(self, account_seq: str, order_id: str) -> dict:
+        return await self._account_post(
+            f'/api/v1/orders/{urllib.parse.quote(order_id, safe="")}/cancel', account_seq, {}
+        )
 
     async def commissions(self, account_seq: str) -> dict:
         result = await self._account_get('/api/v1/commissions', account_seq)
@@ -226,7 +367,7 @@ class TossMarketClient:
                     symbol=item["symbol"].upper(),
                     price=Decimal(item["lastPrice"]),
                     currency=Currency(item["currency"]),
-                    timestamp=utc_now(),
+                    timestamp=datetime.fromisoformat(item['timestamp']),
                     source="toss",
                 )
             )

@@ -8,11 +8,16 @@ const state = {
   risk: null,
   reportPeriod: "daily",
   reportLookup: {},
+  recommendations: null,
 };
 let toastTimer;
 const closingPositions = new Set();
 let positionQuoteRefreshAt = 0;
 let positionQuoteRefreshPromise = null;
+let dashboardSessionPromise = null;
+
+// Remove the legacy browser copy; the API secret stays on the server.
+try { sessionStorage.removeItem("api-access-token"); } catch {}
 
 function applyTheme(theme) {
   const selected = theme === "light" ? "light" : "dark";
@@ -24,12 +29,29 @@ function applyTheme(theme) {
   try { localStorage.setItem("trader-theme", selected); } catch {}
 }
 
-async function request(path, options = {}) {
-  const response = await fetch(path, {
-    cache: "no-store",
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
+async function ensureDashboardSession() {
+  if (!dashboardSessionPromise) {
+    dashboardSessionPromise = (async () => {
+      const response = await fetch(`${API}/auth/local-session`, {
+        method: "POST", headers: { "X-Dashboard-Request": "1" },
+        credentials: "same-origin", cache: "no-store",
+      });
+      if (!response.ok) throw new Error("대시보드 자동 인증에 실패했습니다. 현재 PC의 127.0.0.1 또는 localhost 화면에서 다시 연결하세요.");
+    })().finally(() => { dashboardSessionPromise = null; });
+  }
+  return dashboardSessionPromise;
+}
+
+async function request(path, options = {}, allowSessionRefresh = true) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const response = await fetch(path, { ...options, credentials: "same-origin", cache: "no-store", headers });
+  if (response.status === 401 && allowSessionRefresh) {
+    await ensureDashboardSession();
+    return request(path, options, false);
+  }
+  if (response.status === 401) {
+    throw new Error("LIVE 인증 연결이 만료되었거나 실패했습니다. 화면을 새로고침하세요.");
+  }
   const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.detail || (response.status >= 500
     ? `서버가 요청을 처리하지 못했습니다 (${response.status}). 잠시 후 다시 조회해 주세요.`
@@ -54,6 +76,15 @@ function number(value, currency) {
 
 function money(value, currency) {
   return `${number(value, currency)} ${currency}`;
+}
+
+function liveExposureLabel(limits) {
+  const ratio = Number(limits?.max_total_exposure_ratio ?? 0.15);
+  return `총자산 ${ratio * 100}% ${ratio >= 1 ? "이내" : "미만"}`;
+}
+
+function liveOrderLimitLabel(limits) {
+  return Number(limits?.max_order_amount_krw) > 0 ? money(limits.max_order_amount_krw, "KRW") : "가용 현금 한도";
 }
 
 function marketCap(value) {
@@ -101,17 +132,31 @@ function renderStatus(status, risk) {
   $("#engineDetail").textContent = status.last_error
     ? `오류: ${status.last_error}`
     : [status.automation?.execution_state, status.automation?.message].filter(Boolean).join(" · ") || `v${status.version} · ${status.market_data.toUpperCase()} 시세`;
+  if (status.mode === "live" && !status.live_readiness?.reconciled) {
+    $("#engineDetail").textContent = "LIVE 계좌 동기화 실패 또는 미완료 · 연결을 복구한 뒤 다시 동기화하세요.";
+  } else if (status.mode === "live" && !status.live_readiness?.armed) {
+    $("#engineDetail").textContent = "LIVE 자동 실행은 계좌 동기화와 별도 수동 무장 후에만 가능합니다.";
+  }
   const auto = status.automation;
   if ($("#signalObservationCount")) $("#signalObservationCount").textContent = `${number(auto?.signal_observation_count || 0, "KRW")}건`;
   renderDiagnostics(auto?.diagnostics);
   $("#autoBudgetStatus").textContent = auto && Number(auto.budget) > 0
-    ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 원가 ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
+    ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 ${status.mode === "live" ? "평가액" : "원가"} ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
     : "최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 또는 터치 후 -2% 매도";
   const weekly = auto?.weekly;
   $("#scalpSummary").textContent = weekly ? `누적 실현손익 ${money(weekly.realized_profit, "KRW")} · 청산 매수원가 대비 ${weekly.return_percent ?? "-"}% · 보유 중 제외` : "기록 대기";
   $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)} · ${escapeHtml(day.name || day.symbol || "")}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
   $("#startButton").textContent = auto && Number(auto.budget) > 0 ? "가상 자동매매 재개" : "가상 자동매매 시작";
-  $("#startButton").disabled = status.running || status.kill_switch;
+  const liveArmButton = $("#liveArmButton");
+  liveArmButton.hidden = status.mode !== "live";
+  liveArmButton.textContent = status.live_readiness?.armed ? "LIVE 무장 해제" : "LIVE 계좌 동기화·무장";
+  liveArmButton.disabled = status.running || status.kill_switch;
+  if (status.mode === "live") {
+    $("#startButton").textContent = status.running ? "LIVE 자동매매 실행 중" : "LIVE 자동매매 시작";
+  }
+  const liveNotReady = status.mode === "live"
+    && !(status.live_readiness?.reconciled && status.live_readiness?.armed);
+  $("#startButton").disabled = status.running || status.kill_switch || liveNotReady;
   $("#stopButton").disabled = !status.running;
   $("#killButton").disabled = status.kill_switch;
   $("#clearKillButton").disabled = !status.kill_switch;
@@ -124,11 +169,29 @@ function renderStatus(status, risk) {
     : "토스 API 키가 설정되지 않았습니다. 시세 연동을 위해 .env 설정을 확인하세요.";
   $("#tossRefreshButton").disabled = status.market_data !== "toss";
   const isPaper = status.mode === "paper";
-  $("#investmentSettingsButton").disabled = !isPaper;
+  $("#marketEyebrow").textContent = isPaper ? "TOSS MARKET · PAPER" : "TOSS MARKET · LIVE ACCOUNT";
+  $("#accountHeading").textContent = isPaper ? "가상계좌" : "토스 실계좌";
+  $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
+  $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
+  $("#capitalMode").textContent = isPaper ? "PAPER" : "LIVE";
+  $("#investmentSettingsButton").disabled = false;
+  const maxRatio = isPaper ? 50 : Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15) * 100;
+  $("#investmentRatioInput").max = String(maxRatio);
+  $("#capitalRatioInput").max = String(maxRatio);
+  $("#investmentRatioHelp").textContent = isPaper
+    ? "매수 신호가 오면 설정한 자산 비율과 가용 현금으로 주문합니다. 최대 5종목을 보유합니다."
+    : `LIVE 매수 후 보유 평가액과 미체결 매수의 합계에 ${liveExposureLabel(risk?.live_limits)}를 적용합니다. ${risk?.live_limits?.symbol_policy === "recommended" ? "최신 추천 조건 통과 종목만 매수합니다." : "종목 허용목록도 적용합니다."} 주문 수량은 가용 현금과 수수료로 계산합니다.`;
+  $("#tradingHoursHelp").textContent = `평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00 · 5분 간격 확인 · ${isPaper ? "PAPER" : "LIVE 실계좌"} 주문`;
+  $("#strategyCapitalHelp").textContent = isPaper ? "1회 매수 비율 설정 · PAPER" : `${liveExposureLabel(risk?.live_limits)} · LIVE`;
+  $("#screeningEyebrow").textContent = isPaper ? "PAPER SCREENING" : "LIVE SCREENING";
+  $("#manualCloseHelp").textContent = isPaper
+    ? "최신 거래 분봉으로 PAPER 전량 매도합니다. 당일 자동 재매수 제외"
+    : "최신 호가와 매도 가능 수량을 확인하여 실계좌 시장가 매도를 제출합니다. 부분 체결 시 잔량 취소를 확인합니다. 당일 자동 재매수 제외";
   $("#tradingModeButton").textContent = isPaper ? "PAPER" : "실계좌 주문";
   $("#tradingModeButton").className = `button status-button ${isPaper ? "status-paper" : "status-live"}`;
   if (status.market_data !== "toss") setTossConnection(false);
-  if (risk) $("#killSwitchLabel").title = `KRW 주문 한도 ${risk.max_order_amount.KRW}`;
+  if (risk) $("#killSwitchLabel").title = `KRW 주문 한도 ${isPaper ? risk.max_order_amount.KRW : liveOrderLimitLabel(risk.live_limits)}`;
+  if (state.recommendations) renderRecommendations(state.recommendations, false);
 }
 
 function renderDiagnostics(diagnostics) {
@@ -160,25 +223,39 @@ function renderDiagnostics(diagnostics) {
 function renderAccount(account, performance) {
   state.account = account;
   state.performance = performance;
-  $("#krwCash").textContent = money(account.cash.KRW, "KRW");
-  $("#usdCash").textContent = money(account.cash.USD, "USD");
-  $("#krwEquity").textContent = money(performance.by_currency.KRW.current_equity, "KRW");
-  $("#usdEquity").textContent = money(performance.by_currency.USD.current_equity, "USD");
+  const isLive = account.mode === "live";
+  const cash = account.buying_power || account.cash || {};
+  const rows = performance.by_currency || {};
+  $("#accountHeading").textContent = isLive ? "\ud1a0\uc2a4 \uacc4\uc88c" : "\uac00\uc0c1 \uacc4\uc88c";
+  $("#accountModeBadge").textContent = isLive ? "LIVE" : "PAPER";
+  $("#accountModeBadge").className = `badge ${isLive ? "status-live" : "badge-paper"}`;
+  $("#krwCashLabel").textContent = isLive ? "KRW \uc8fc\ubb38 \uac00\ub2a5 \uae08\uc561" : "KRW \ud604\uae08";
+  $("#usdCashLabel").textContent = isLive ? "USD \uc8fc\ubb38 \uac00\ub2a5 \uae08\uc561" : "USD \ud604\uae08";
+  $("#krwCash").textContent = money(cash.KRW, "KRW");
+  $("#usdCash").textContent = money(cash.USD, "USD");
+  $("#krwEquity").textContent = money(account.total_equity?.KRW ?? rows.KRW?.current_equity, "KRW");
+  $("#usdEquity").textContent = money(account.total_equity?.USD ?? rows.USD?.current_equity, "USD");
   for (const currency of ["KRW", "USD"]) {
     const target = $(`#${currency.toLowerCase()}Return`);
-    const row = performance.by_currency[currency];
-    const rate = Number(row.return_rate_percent);
-    target.textContent = `${rate >= 0 ? "+" : ""}${rate.toFixed(2)}% · 누적손익(실현+평가) ${money(row.profit_loss, currency)}`;
+    if (isLive) {
+      target.textContent = "\uc2e4\uacc4\uc88c \uc190\uc775 \ubbf8\uc9d1\uacc4";
+      target.className = "metric-change";
+      continue;
+    }
+    const row = rows[currency] || {};
+    const rate = Number(row.return_rate_percent || 0);
+    target.textContent = `${rate >= 0 ? "+" : ""}${rate.toFixed(2)}% P/L (realized + unrealized) ${money(row.profit_loss, currency)}`;
     target.className = `metric-change ${rate > 0 ? "positive" : rate < 0 ? "negative" : ""}`;
   }
-  $("#filledOrders").textContent = performance.orders.filled;
-  $("#rejectedOrders").textContent = performance.orders.rejected;
-  renderPositions(account.positions);
+  const orders = performance.orders || {};
+  $("#filledOrders").textContent = orders.filled ?? 0;
+  $("#rejectedOrders").textContent = orders.rejected ?? 0;
+  renderPositions(account.positions || []);
 }
 
 function renderCapital(account, risk, status, performance) {
   const isPaper = status.mode === "paper";
-  const accountAmount = Number(performance.by_currency.KRW.current_equity || account.total_equity.KRW || 0);
+  const accountAmount = Number((isPaper ? performance.by_currency?.KRW?.current_equity : null) || account.total_equity?.KRW || 0);
   const availableCash = Number(account.cash.KRW || 0);
   const tradeRatio = Number(risk.recommended_trade_ratio ?? 0.1);
   const hasSession = Number(status.automation?.budget) > 0;
@@ -187,12 +264,12 @@ function renderCapital(account, risk, status, performance) {
   $("#investmentRatioInput").value = String(Math.round(tradeRatio * 100));
   $("#investmentRatioValue").textContent = `${ratioPercent}%`;
   $("#capitalRatioInput").value = String(Math.round(tradeRatio * 100));
-  $("#capitalRatioInput").disabled = !isPaper;
+  $("#capitalRatioInput").disabled = false;
   $("#capitalRatioValue").textContent = `${ratioPercent}%`;
   $("#capitalRatioPreview").textContent = `${money(Math.min(availableCash, accountAmount * tradeRatio), "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
   $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
-  $("#capitalMode").textContent = isPaper ? "PAPER" : "REAL";
+  $("#capitalMode").textContent = isPaper ? "PAPER" : "LIVE";
   $("#capitalMode").className = `badge ${isPaper ? "badge-paper" : "status-live"}`;
   $("#capitalAccountAmount").textContent = money(accountAmount, "KRW");
   $("#capitalRecommendationAmount").textContent = money(recommendationAmount, "KRW");
@@ -200,9 +277,25 @@ function renderCapital(account, risk, status, performance) {
     ? `평가금액의 ${ratioPercent}% 한도에서 보유 원가를 제외한 예산 · 최대 5종목 · 매도 후 재사용`
     : `평가금액의 ${ratioPercent}%를 스윙 예산으로 사용 · 최대 5종목 · 종목별 주문 한도 적용`;
   $("#capitalRecommendationHelp").textContent = `총평가금액의 ${ratioPercent}%를 1회 매수 목표로 사용 · 분할매수 없음 · 최대 5종목`;
+  if (!isPaper) {
+    $("#capitalRecommendationHelp").textContent = `${liveExposureLabel(risk.live_limits)}에서 보유 평가액·미체결 매수를 차감 · 1회 주문은 ${liveOrderLimitLabel(risk.live_limits)}`;
+    $("#capitalRatioPreview").textContent = `${money(recommendationAmount, "KRW")} 현재 추가 매수 가능 예산`;
+  }
 }
 
-function renderRecommendations(payload) {
+function buyBlockReason(symbol) {
+  if (!state.status?.automation?.market_open) return "거래시간 외";
+  if (state.status?.kill_switch) return "긴급 중지 상태";
+  if (state.status?.mode !== "live") return "";
+  if (!(state.status.live_readiness?.armed && state.status.live_readiness?.reconciled)) return "LIVE 동기화·무장 필요";
+  if (state.risk?.live_limits?.symbol_policy !== "recommended"
+      && !state.risk?.live_limits?.allowed_symbols?.includes(symbol)) return "LIVE 허용목록에 없음";
+  if (Number(state.status.automation.remaining) <= 0) return "추가 매수 한도 없음";
+  return "";
+}
+
+function renderRecommendations(payload, scroll = true) {
+  state.recommendations = payload;
   const container = $("#recommendationResults");
   container.hidden = false;
   $("#recommendationBudget").textContent = `사용 금액 ${money(payload.budget, "KRW")}`;
@@ -232,7 +325,7 @@ function renderRecommendations(payload) {
         </div>
         <p class="recommendation-reason">${escapeHtml(item.reason)}</p>
         <div class="recommendation-quantity">종목별 배분·주문 한도 적용 시 최대 ${number(item.quantity, "KRW")}주</div>
-        <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>&#51312;&#44148;&#32;&#53685;&#44284;&#32;&#51333;&#47785;&#32;&#51088;&#49328;&#32;&#48708;&#50984;&#32;&#47588;&#49688;</button>
+        <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${buyBlockReason(item.symbol) ? "disabled" : ""}>${escapeHtml(buyBlockReason(item.symbol) || (state.status?.mode === "live" ? "LIVE 실계좌 조건 확인·매수" : "조건 통과 종목 자산 비율 매수"))}</button>
       </article>`).join("")
     : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
   const watchlist = payload.watchlist || [];
@@ -243,10 +336,10 @@ function renderRecommendations(payload) {
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
         <div class="recommendation-metrics"><div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 현재가 거리 ${escapeHtml(item.band_distance_percent)}%</div></div>
         <p class="recommendation-reason">미충족: ${escapeHtml((item.rejection_reasons || []).join(" · "))}</p>
-        <button type="button" class="button button-secondary full" data-test-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>1주 PAPER 테스트 매수</button>
+        ${state.status?.mode === "paper" ? `<button type="button" class="button button-secondary full" data-test-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>1주 PAPER 테스트 매수</button>` : '<p class="muted">조건 미충족 · LIVE 매수 불가</p>'}
       </article>`).join("")}</div>`
     : "";
-  container.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (scroll) container.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 const chartState = { symbol: null, name: null, interval: "1d" };
@@ -472,7 +565,7 @@ function renderPositions(positions) {
       <td class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${hasQuote
         ? `${number(pnl, position.currency)}<br><span class="muted">${pnlRate > 0 ? "+" : ""}${pnlRate.toFixed(2)}%</span>`
         : '<span class="muted">계산 대기</span>'}</td>
-      <td><button type="button" class="button button-danger" data-close-position="${escapeHtml(position.symbol)}" ${closingPositions.has(position.symbol) || position.currency !== "KRW" ? "disabled" : ""} aria-label="${escapeHtml(position.name || position.symbol)} 수동 전량 매도">${closingPositions.has(position.symbol) ? "매도 중…" : "수동 전량매도"}</button></td>
+      <td><button type="button" class="button button-danger" data-close-position="${escapeHtml(position.symbol)}" ${closingPositions.has(position.symbol) || position.currency !== "KRW" || (state.status?.mode === "live" && (!(state.status.live_readiness?.armed && state.status.live_readiness?.reconciled) || state.status.kill_switch || !state.status.automation?.market_open)) ? "disabled" : ""} aria-label="${escapeHtml(position.name || position.symbol)} 수동 전량 매도">${closingPositions.has(position.symbol) ? "매도 중…" : state.status?.mode === "live" ? "LIVE 전량매도" : "수동 전량매도"}</button></td>
     </tr>`;
   }).join("");
 }
@@ -510,12 +603,15 @@ async function loadAll(silent = false) {
       }
       await positionQuoteRefreshPromise;
     }
-    const [status, account, performance, orders, quotes, risk] = await Promise.all([
-      request(`${API}/system/status`), request(`${API}/paper/account`), request(`${API}/performance`),
-      request(`${API}/orders`), request(`${API}/market/quotes`), request(`${API}/risk/status`),
-    ]);
+    const status = await request(`${API}/system/status`);
+    const risk = await request(`${API}/risk/status`);
     state.risk = risk;
     renderStatus(status, risk);
+    const accountPath = status.mode === "live" ? `${API}/live/account` : `${API}/paper/account`;
+    const [account, performance, orders, quotes] = await Promise.all([
+      request(accountPath), request(`${API}/performance`), request(`${API}/orders`),
+      request(`${API}/market/quotes`),
+    ]);
     renderAccount(account, performance);
     renderCapital(account, risk, status, performance);
     renderOrders(orders.orders);
@@ -523,6 +619,14 @@ async function loadAll(silent = false) {
     if (!silent) toast("최신 상태를 불러왔습니다.");
   } catch (error) {
     setTossConnection(false);
+    if (state.status?.mode === "live") {
+      $("#accountModeBadge").textContent = "LIVE · SYNC FAILED";
+      $("#accountModeBadge").title = error.message;
+      if (!state.account) {
+        $("#krwEquity").textContent = "조회 불가";
+        $("#usdEquity").textContent = "조회 불가";
+      }
+    }
     if (!silent) toast(error.message, true);
   }
 }
@@ -537,7 +641,7 @@ async function action(path, message) {
 
 const investmentSettingsDialog = $("#investmentSettingsDialog");
 $("#investmentSettingsButton").addEventListener("click", () => {
-  if (state.status?.mode !== "paper") return;
+  if (!state.status) return;
   const currentPercent = Math.round(Number(state.risk?.recommended_trade_ratio ?? 0.1) * 100);
   $("#investmentRatioInput").value = String(currentPercent);
   $("#investmentRatioValue").textContent = `${currentPercent}%`;
@@ -590,7 +694,10 @@ function previewInvestmentRatio(percent) {
   const equity = Number(state.performance?.by_currency?.KRW?.current_equity || state.account?.total_equity?.KRW || 0);
   const cash = Number(state.account?.cash?.KRW || 0);
   const amount = Math.min(cash, equity * Number(percent) / 100);
-  $("#capitalRatioPreview").textContent = `${money(amount, "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
+  const liveRemaining = Math.max(0, Math.min(cash, equity * Number(percent) / 100 - Number(state.status?.automation?.spent || 0) - 1));
+  $("#capitalRatioPreview").textContent = state.status?.mode === "live"
+    ? `${money(liveRemaining, "KRW")} 예상 예산 · 미체결 매수·주문 한도는 서버에서 재검사`
+    : `${money(amount, "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
 }
 
 async function saveInvestmentRatio(ratioPercent) {
@@ -605,12 +712,16 @@ $("#positionsTable").addEventListener("click", async (event) => {
   if (!button || button.disabled) return;
   const symbol = button.dataset.closePosition;
   if (closingPositions.has(symbol)) return;
+  const live = state.status?.mode === "live";
+  if (live && !confirm(`${symbol}: 실제 보유 수량을 시장가로 전량 매도할까요? 주문 한도와 매도 가능 수량을 다시 확인합니다.`)) return;
   closingPositions.add(symbol);
   button.disabled = true;
   button.textContent = "매도 중…";
   try {
-    await request(`${API}/paper/positions/${encodeURIComponent(symbol)}/close`, { method: "POST" });
-    toast(`${symbol} 가상 전량 매도 완료 · 당일 자동 재매수 제외`);
+    const result = await request(`${API}/${live ? "live" : "paper"}/positions/${encodeURIComponent(symbol)}/close`, {
+      method: "POST", ...(live ? { body: JSON.stringify({ confirm_real_order: true }) } : {}),
+    });
+    toast(`${symbol} ${result.message} · 당일 자동 재매수 제외`);
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -624,17 +735,21 @@ $("#recommendationList").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-qualified-buy]");
   if (!button || button.disabled) return;
   const symbol = button.dataset.qualifiedBuy;
-  if (!confirm(`${symbol}: 매수 조건을 다시 확인하고 설정된 자산 비율로 PAPER 매수할까요?`)) return;
+  const live = state.status?.mode === "live";
+  if (buyBlockReason(symbol)) return;
+  if (!confirm(`${symbol}: 매수 조건과 예산을 다시 확인하고 ${live ? "실계좌 시장가" : "PAPER"} 매수할까요?${live ? ` ${liveExposureLabel(state.risk?.live_limits)}와 최신 추천·가용 현금 기준을 적용합니다.` : ""}`)) return;
   button.disabled = true;
-  button.textContent = "PAPER 매수 중...";
+  button.textContent = live ? "LIVE 매수 확인 중…" : "PAPER 매수 중…";
   try {
-    await request(`${API}/paper/qualified-buy/${encodeURIComponent(symbol)}`, { method: "POST" });
-    toast(`${symbol} PAPER 매수 완료`);
-    await loadAll(true);
+    const result = await request(`${API}/${live ? "live" : "paper"}/qualified-buy/${encodeURIComponent(symbol)}`, {
+      method: "POST", ...(live ? { body: JSON.stringify({ confirm_real_order: true }) } : {}),
+    });
+    toast(`${symbol} ${result.message}`);
   } catch (error) {
     toast(error.message, true);
-    button.disabled = false;
-    button.textContent = "\uC870\uAC74 \uD1B5\uACFC \uC885\uBAA9 \uC790\uC0B0 \uBE44\uC728 \uB9E4\uC218";
+  } finally {
+    await loadAll(true);
+    if (state.recommendations) renderRecommendations(state.recommendations, false);
   }
 });
 
@@ -642,6 +757,7 @@ $("#recommendationWatchlist").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-test-buy]");
   if (!button || button.disabled) return;
   const symbol = button.dataset.testBuy;
+  if (state.status?.mode !== "paper") return;
   if (!confirm(`${symbol}을 현재 시세로 1주 PAPER 테스트 매수할까요? 실제 주문은 발생하지 않습니다.`)) return;
   button.disabled = true;
   button.textContent = "테스트 주문 중…";
@@ -681,13 +797,27 @@ document.querySelector("[data-chart-minute-toggle]").addEventListener("click", (
 $("#candidateChartClose").addEventListener("click", () => { $("#candidateChartPanel").hidden = true; });
 
 $("#startButton").addEventListener("click", async () => {
+  if (state.status?.mode === "live"
+      && !confirm("실계좌 자동매매를 시작합니다. 추천 종목과 위험 한도를 통과한 주문은 실제 계좌에 제출됩니다. 시작할까요?")) return;
   $("#startButton").disabled = true;
-  await action(`${API}/engine/start`, "추천 예산으로 가상 자동매매를 시작했습니다.");
+  await action(`${API}/engine/start`, state.status?.mode === "live" ? "LIVE 실계좌 자동매매를 시작했습니다." : "추천 예산으로 가상 자동매매를 시작했습니다.");
   await loadAll(true);
 });
 $("#stopButton").addEventListener("click", () => action(`${API}/engine/stop`, "엔진을 안전하게 중지했습니다."));
+$("#liveArmButton").addEventListener("click", async () => {
+  const armed = state.status?.live_readiness?.armed;
+  const message = armed
+    ? "LIVE 무장을 해제하고 엔진을 중지할까요?"
+    : "토스 계좌를 다시 동기화하고 LIVE 주문을 허용 상태로 무장합니다. 추천 종목 매수·보유 종목 매도 버튼과 자동매매에서 실제 주문을 제출할 수 있습니다. 계속할까요?";
+  if (!confirm(message)) return;
+  try {
+    await request(`${API}/live/${armed ? "disarm" : "arm"}`, { method: "POST" });
+    toast(armed ? "LIVE 무장을 해제했습니다." : "LIVE 계좌 동기화와 무장이 완료됐습니다.");
+    await loadAll(true);
+  } catch (error) { toast(error.message, true); }
+});
 $("#killButton").addEventListener("click", () => {
-  if (confirm("신규 가상 주문을 즉시 차단하고 엔진을 중지할까요?")) action(`${API}/risk/kill-switch`, "킬 스위치를 활성화했습니다.");
+  if (confirm("신규 주문을 즉시 차단하고 엔진을 중지할까요?")) action(`${API}/risk/kill-switch`, "킬 스위치를 활성화했습니다.");
 });
 $("#clearKillButton").addEventListener("click", () => action(`${API}/risk/kill-switch/clear`, "킬 스위치를 해제했습니다."));
 $("#refreshAllButton").addEventListener("click", async () => {

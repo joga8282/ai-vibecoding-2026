@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import quote as url_quote
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from app.config import Settings
+from app.dashboard_auth import COOKIE_NAME, SESSION_SECONDS, LocalDashboardSessions, is_local_dashboard_request
 from app.engine import TradingEngine
-from app.models import Currency, Quote, ThresholdStrategy, serialize, utc_now
+from app.models import Currency, OrderStatus, Quote, Side, ThresholdStrategy, serialize, utc_now
 from app.paper import PaperBroker
 from app.brokers.toss_real import TossRealBroker
 from app.repository import SnapshotRepository
@@ -60,7 +63,19 @@ class PaperResetInput(BaseModel):
 
 
 class InvestmentRatioInput(BaseModel):
-    ratio_percent: Decimal = Field(ge=1, le=50)
+    ratio_percent: Decimal = Field(ge=1, le=100)
+
+
+class LiveLimitOrderTestInput(BaseModel):
+    symbol: str = Field(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9.\-]+$")
+    side: Side
+    quantity: Literal[1]
+    limit_price: PositiveDecimal
+    confirm_real_order: Literal[True]
+
+
+class LiveTradeInput(BaseModel):
+    confirm_real_order: Literal[True]
 
 
 def get_engine(request: Request) -> TradingEngine:
@@ -70,9 +85,12 @@ def get_engine(request: Request) -> TradingEngine:
 def require_live_access(request: Request) -> TossRealBroker:
     settings = request.app.state.settings
     if settings.mode != 'live' or not getattr(request.app.state, 'live_broker', None):
-        raise HTTPException(status_code=409, detail='LIVE 읽기 전용 모드가 아닙니다.')
-    if settings.api_access_token and request.headers.get('X-API-Token') != settings.api_access_token:
-        raise HTTPException(status_code=401, detail='LIVE API 인증이 필요합니다.')
+        raise HTTPException(status_code=409, detail='LIVE 모드가 아닙니다.')
+    if settings.api_access_token:
+        header_valid = secrets.compare_digest(request.headers.get('X-API-Token', ''), settings.api_access_token)
+        sessions = getattr(request.app.state, 'dashboard_sessions', None)
+        if not header_valid and not (sessions and sessions.allows(request, settings.api_access_token)):
+            raise HTTPException(status_code=401, detail='LIVE API 인증이 필요합니다.')
     return request.app.state.live_broker
 
 
@@ -87,10 +105,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         trading_preferences = await repository.load("trading_preferences") or {}
         saved_ratio = trading_preferences.get("recommended_trade_ratio")
         if saved_ratio is not None:
-            selected_settings = replace(
-                selected_settings,
-                recommended_trade_ratio=Decimal(str(saved_ratio)),
-            )
+            try:
+                ratio = Decimal(str(saved_ratio))
+                maximum = selected_settings.live_max_total_exposure_ratio if selected_settings.mode == 'live' else Decimal('.5')
+                if ratio.is_finite() and Decimal('.01') <= ratio <= maximum:
+                    selected_settings = replace(selected_settings, recommended_trade_ratio=ratio)
+            except (ArithmeticError, ValueError, TypeError):
+                logging.getLogger(__name__).warning('Ignoring invalid saved investment ratio.')
+        if selected_settings.mode == 'live':
+            selected_settings = replace(selected_settings, recommended_trade_ratio=min(
+                selected_settings.recommended_trade_ratio, selected_settings.live_max_total_exposure_ratio))
         toss_client = None
         if (
             selected_settings.toss_market_data_enabled
@@ -103,7 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if selected_settings.mode == 'live':
             if not toss_client:
                 raise RuntimeError('LIVE 읽기 전용 모드에는 토스 API 인증정보가 필요합니다.')
-            broker = TossRealBroker(toss_client, selected_settings.toss_account_seq, repository)
+            broker = TossRealBroker(toss_client, selected_settings.toss_account_seq, repository, selected_settings)
         else:
             broker = PaperBroker(selected_settings, repository)
         await broker.restore()
@@ -115,10 +139,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.engine = engine
         app.state.weekly_report = WeeklyReportService()
         app.state.live_broker = broker if selected_settings.mode == 'live' else None
-        if selected_settings.mode == 'paper':
+        if selected_settings.mode == 'live' and selected_settings.live_trading_enabled:
+            try:
+                result = await broker.reconcile()
+                if not result['reconciled']:
+                    logging.getLogger(__name__).error(
+                        "LIVE startup reconciliation did not complete; account actions remain unavailable."
+                    )
+            except Exception as exc:
+                # A temporary broker/network outage must not take down the dashboard.
+                # No account values are considered current and LIVE remains disarmed.
+                broker.reconciled = False
+                broker.last_error = f'{type(exc).__name__}: account sync unavailable'
+                if broker.risk:
+                    broker.risk.armed = False
+                    broker.risk.reconciled = False
+                logging.getLogger(__name__).warning(
+                    "LIVE startup account sync unavailable (%s); dashboard will start read-only.",
+                    type(exc).__name__,
+                )
+        if selected_settings.mode == 'paper' or selected_settings.live_trading_enabled:
             engine.automation = SwingTrader(engine, lambda: build_recommendations(engine, app.state.weekly_report.cached_direction()))
             await engine.automation.restore()
-        if selected_settings.mode == 'paper' and toss_client and broker.positions:
+        if selected_settings.mode in {'paper', 'live'} and toss_client and broker.positions:
             try:
                 stocks = await asyncio.wait_for(toss_client.stocks_info(sorted(broker.positions)), timeout=10)
                 await repository.update_position_names({stock['symbol']: stock.get('name') for stock in stocks})
@@ -133,17 +176,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title=selected_settings.app_name,
         version=selected_settings.version,
         description=(
-            "PAPER 자동매매와 토스 실계좌 읽기 전용 동기화를 지원합니다. "
-            "LIVE 주문 전송은 잠겨 있습니다."
+            "PAPER 자동매매와 토스 LIVE 자동매매를 지원합니다. "
+            "LIVE는 별도 설정, 계좌 재조정, API 인증 및 수동 무장 후에만 주문합니다."
         ),
         lifespan=lifespan,
     )
     static_dir = Path(__file__).parent / "static"
+    app.state.dashboard_sessions = LocalDashboardSessions()
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/", include_in_schema=False)
     async def dashboard() -> FileResponse:
         return FileResponse(static_dir / "index.html")
+
+    @app.post('/api/v1/auth/local-session')
+    async def local_dashboard_session(request: Request) -> JSONResponse:
+        if (request.headers.get('X-Dashboard-Request') != '1'
+                or not is_local_dashboard_request(request, require_origin=True)):
+            raise HTTPException(status_code=403, detail='현재 PC의 localhost 대시보드에서만 자동 인증할 수 있습니다.')
+        settings = request.app.state.settings
+        if settings.mode != 'live' or not settings.api_access_token:
+            raise HTTPException(status_code=409, detail='LIVE 대시보드 인증 설정을 확인하세요.')
+        session = request.app.state.dashboard_sessions.issue(request, settings.api_access_token)
+        response = JSONResponse({'authenticated': True}, headers={'Cache-Control': 'no-store'})
+        response.set_cookie(COOKIE_NAME, session, max_age=SESSION_SECONDS, path='/api/v1',
+                            httponly=True, samesite='strict', secure=request.url.scheme == 'https')
+        return response
 
     @app.get("/health/live")
     async def health_live() -> dict:
@@ -165,9 +223,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get('/api/v1/live/status')
     async def live_status(request: Request) -> dict:
         broker = require_live_access(request)
-        return {'mode': 'live-readonly', 'orders_enabled': False, 'reconciled': broker.reconciled,
+        return {'mode': 'live' if broker.settings and broker.settings.live_trading_enabled else 'live-readonly',
+                'orders_enabled': bool(broker.risk and broker.settings and broker.settings.live_trading_enabled),
+                'armed': bool(broker.risk and broker.risk.armed), 'reconciled': broker.reconciled,
                 'last_sync_at': broker.last_sync_at.isoformat() if broker.last_sync_at else None,
                 'last_error': broker.last_error}
+
+    @app.post('/api/v1/live/arm')
+    async def live_arm(request: Request) -> dict:
+        broker = require_live_access(request)
+        try:
+            result = await broker.reconcile()
+            if not result['reconciled']:
+                raise RuntimeError('계좌 재조정 불일치가 있어 LIVE 무장을 거부했습니다.')
+            broker.arm()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "LIVE arming failed during account sync (%s).", type(exc).__name__
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f'LIVE 계좌 동기화에 실패했습니다: {type(exc).__name__}',
+            ) from exc
+        return {'armed': True, 'reconciled': broker.reconciled}
+
+    @app.post('/api/v1/live/disarm')
+    async def live_disarm(request: Request) -> dict:
+        broker = require_live_access(request)
+        broker.disarm()
+        await get_engine(request).stop()
+        return {'armed': False, 'running': False}
 
     @app.post('/api/v1/live/reconcile')
     async def live_reconcile(request: Request) -> dict:
@@ -185,9 +272,106 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def live_positions(request: Request) -> dict:
         return {'positions': await require_live_access(request).get_positions()}
 
+    @app.get('/api/v1/live/account')
+    async def live_account(request: Request) -> dict:
+        broker = require_live_access(request)
+        try:
+            result = await broker.reconcile(recover_unfinished_orders=False)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f'LIVE 계좌 동기화 실패: {type(exc).__name__}') from exc
+        if not result.get('reconciled'):
+            details = '; '.join(result.get('mismatches', []))
+            raise HTTPException(status_code=409, detail='계좌 잔액 동기화 실패: ' + details)
+        account = broker.account(get_engine(request).quotes)
+        account['buying_power'] = dict(account['cash'])
+        account['last_sync_at'] = broker.last_sync_at.isoformat() if broker.last_sync_at else None
+        account['positions'] = await get_engine(request).with_stock_names(account['positions'])
+        return account
+
     @app.get('/api/v1/live/orders')
-    async def live_orders(request: Request, order_status: str | None = None) -> dict:
+    async def live_orders(request: Request, order_status: str = Query(default='OPEN')) -> dict:
         return {'orders': await require_live_access(request).list_orders(order_status)}
+
+    @app.post('/api/v1/live/orders/{order_id}/cancel')
+    async def cancel_live_order(order_id: str, request: Request) -> dict:
+        broker = require_live_access(request)
+        if get_engine(request).running:
+            raise HTTPException(status_code=409, detail='Stop the trading engine before manually canceling an order.')
+        try:
+            order = await broker.cancel_and_resolve_order(order_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            'order': serialize(order),
+            'cancel_confirmed': order.status in {OrderStatus.CANCELED, OrderStatus.PARTIALLY_FILLED},
+            'fully_filled': order.status is OrderStatus.FILLED,
+        }
+
+    @app.post('/api/v1/live/test-limit-order/submit')
+    async def submit_live_test_limit_order(payload: LiveLimitOrderTestInput, request: Request) -> dict:
+        broker = require_live_access(request)
+        engine = get_engine(request)
+        if engine.running:
+            raise HTTPException(status_code=409, detail='Stop the trading engine before a test order.')
+        if engine.kill_switch:
+            raise HTTPException(status_code=409, detail='Disable the kill switch before a test order.')
+        if not broker.settings or not broker.settings.live_trading_enabled:
+            raise HTTPException(status_code=409, detail='LIVE order submission is disabled.')
+        if not broker.risk or not broker.risk.armed or not broker.reconciled:
+            raise HTTPException(status_code=409, detail='Reconcile and arm LIVE before a test order.')
+        try:
+            quote = await engine.lookup_quote(payload.symbol)
+            order = await broker.submit_limit_order(
+                client_order_id='manual-limit-test-' + uuid4().hex,
+                quote=quote,
+                side=payload.side,
+                quantity=Decimal(payload.quantity),
+                limit_price=payload.limit_price,
+            )
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            'order': order,
+            'accepted': True,
+            'cancel_path': f"/api/v1/live/orders/{url_quote(str(order['orderId']), safe='')}/cancel",
+        }
+
+    @app.post('/api/v1/live/test-limit-order')
+    async def live_test_limit_order(payload: LiveLimitOrderTestInput, request: Request) -> dict:
+        broker = require_live_access(request)
+        engine = get_engine(request)
+        if engine.running:
+            raise HTTPException(status_code=409, detail='Stop the trading engine before a test order.')
+        if engine.kill_switch:
+            raise HTTPException(status_code=409, detail='Disable the kill switch before a test order.')
+        if not broker.settings or not broker.settings.live_trading_enabled:
+            raise HTTPException(status_code=409, detail='LIVE order submission is disabled.')
+        if not broker.risk or not broker.risk.armed or not broker.reconciled:
+            raise HTTPException(status_code=409, detail='Reconcile and arm LIVE before a test order.')
+        try:
+            quote = await engine.lookup_quote(payload.symbol)
+            order = await broker.place_limit_order(
+                client_order_id='manual-limit-test-' + uuid4().hex,
+                quote=quote,
+                side=payload.side,
+                quantity=Decimal(payload.quantity),
+                limit_price=payload.limit_price,
+            )
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            'order': serialize(order),
+            'cancel_confirmed': order.status.value in {'CANCELED', 'PARTIALLY_FILLED'},
+            'fully_filled': order.status.value == 'FILLED',
+        }
 
     @app.get("/api/v1/weekly-report")
     async def weekly_report(
@@ -200,6 +384,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/engine/start")
     async def start_engine(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
         try:
             await engine.start()
         except RuntimeError as exc:
@@ -209,12 +395,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/engine/stop")
     async def stop_engine(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
         await engine.stop()
+        broker = getattr(request.app.state, 'live_broker', None)
+        if broker:
+            broker.disarm()
         return engine.status()
 
     @app.post("/api/v1/engine/tick")
     async def tick_engine(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
         if engine.running:
             raise HTTPException(status_code=409, detail="실행 중인 엔진은 자동으로 tick합니다.")
         if engine.kill_switch:
@@ -225,12 +418,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/risk/kill-switch")
     async def activate_kill_switch(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
         await engine.activate_kill_switch()
+        broker = getattr(request.app.state, 'live_broker', None)
+        if broker:
+            broker.disarm()
         return engine.status()
 
     @app.post("/api/v1/risk/kill-switch/clear")
     async def clear_kill_switch(request: Request) -> dict:
         engine = get_engine(request)
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
         try:
             await engine.clear_kill_switch()
         except RuntimeError as exc:
@@ -254,6 +454,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/paper/positions/{symbol}/close")
     async def close_position(symbol: str, request: Request) -> dict:
         engine = get_engine(request)
+        if engine.settings.mode != 'paper':
+            raise HTTPException(status_code=409, detail='PAPER 주문 API는 PAPER 모드에서만 사용할 수 있습니다.')
         if not engine.automation:
             raise HTTPException(status_code=409, detail='LIVE 읽기 전용 모드에서는 주문할 수 없습니다.')
         try:
@@ -272,19 +474,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "kill_switch": engine.kill_switch,
             "max_order_amount": {
-                "KRW": str(settings.max_order_amount_krw),
+                "KRW": str(settings.live_max_order_amount_krw if settings.mode == 'live' else settings.max_order_amount_krw),
                 "USD": str(settings.max_order_amount_usd),
             },
             "fee_rate": str(settings.fee_rate),
             "slippage_bps": str(settings.slippage_bps),
             "recommended_trade_ratio": str(settings.recommended_trade_ratio),
+            "live_limits": {
+                "allowed_symbols": (sorted(getattr(getattr(engine.broker, 'risk', None), 'recommended_symbols', ()))
+                                    if settings.live_symbol_policy == 'recommended' else list(settings.live_allowed_symbols)),
+                "symbol_policy": settings.live_symbol_policy,
+                "max_order_amount_krw": str(settings.live_max_order_amount_krw),
+                "max_total_exposure_krw": str(settings.live_max_total_exposure_krw),
+                "max_total_exposure_ratio": str(settings.live_max_total_exposure_ratio),
+            } if settings.mode == 'live' else None,
         }
 
     @app.put("/api/v1/settings/investment-ratio")
     async def update_investment_ratio(payload: InvestmentRatioInput, request: Request) -> dict:
-        if request.app.state.settings.mode != "paper":
-            raise HTTPException(status_code=409, detail="투자비율 설정은 PAPER 모드에서만 변경할 수 있습니다.")
         ratio = payload.ratio_percent / Decimal("100")
+        if request.app.state.settings.mode == 'live':
+            require_live_access(request)
+            if ratio > request.app.state.settings.live_max_total_exposure_ratio:
+                maximum = request.app.state.settings.live_max_total_exposure_ratio * 100
+                raise HTTPException(status_code=422, detail=f'LIVE 투자비율은 설정된 총자산 한도 {maximum:g}% 이하로 설정하세요.')
+        elif payload.ratio_percent > 50:
+            raise HTTPException(status_code=422, detail='PAPER 투자비율은 50% 이하로 설정하세요.')
         settings = replace(request.app.state.settings, recommended_trade_ratio=ratio)
         await request.app.state.repository.save(
             "trading_preferences", {"recommended_trade_ratio": str(ratio)}
@@ -294,6 +509,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine.settings = settings
         if hasattr(engine.broker, "settings"):
             engine.broker.settings = settings
+        if getattr(engine.broker, 'risk', None):
+            engine.broker.risk.settings = settings
         return {"ratio_percent": str(payload.ratio_percent), "recommended_trade_ratio": str(ratio)}
 
     @app.post("/api/v1/paper/reset")
@@ -420,6 +637,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/paper/qualified-buy/{symbol}")
     async def qualified_buy(symbol: str, request: Request) -> dict:
         engine = get_engine(request)
+        if engine.settings.mode != 'paper':
+            raise HTTPException(status_code=409, detail='PAPER 주문 API는 PAPER 모드에서만 사용할 수 있습니다.')
         try:
             order = await engine.automation.buy_qualified(symbol.strip().upper())
         except RuntimeError as exc:
@@ -428,6 +647,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logging.getLogger(__name__).warning("PAPER qualified buy failed: %s", exc)
             raise HTTPException(status_code=502, detail="조건 통과 종목 매수를 완료하지 못했습니다.") from exc
         return {"order": serialize(order), "message": "자산 비율 PAPER 매수 완료"}
+
+    @app.post('/api/v1/live/qualified-buy/{symbol}')
+    async def live_qualified_buy(symbol: str, payload: LiveTradeInput, request: Request) -> dict:
+        require_live_access(request)
+        engine = get_engine(request)
+        if not engine.automation:
+            raise HTTPException(status_code=409, detail='LIVE 자동매매 주문이 활성화되지 않았습니다.')
+        try:
+            order = await engine.automation.buy_qualified(symbol.strip().upper())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail='LIVE 매수 결과를 확인하지 못했습니다. 주문 내역과 계좌 동기화 상태를 확인하세요.') from exc
+        return {'order': serialize(order), 'message': f'LIVE 매수 결과: {order.status.value} · 체결 {order.quantity}주'}
+
+    @app.post('/api/v1/live/positions/{symbol}/close')
+    async def live_close_position(symbol: str, payload: LiveTradeInput, request: Request) -> dict:
+        require_live_access(request)
+        engine = get_engine(request)
+        if not engine.automation:
+            raise HTTPException(status_code=409, detail='LIVE 자동매매 주문이 활성화되지 않았습니다.')
+        try:
+            orders = await engine.automation.manual_close(symbol.strip().upper())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail='LIVE 매도 결과를 확인하지 못했습니다. 주문 내역과 보유 수량을 확인하세요.') from exc
+        completed = all(o.status is OrderStatus.FILLED for o in orders)
+        return {'orders': serialize(orders), 'message': 'LIVE 전량 매도 완료' if completed else 'LIVE 매도 일부 체결 또는 미체결 · 주문 내역 확인'}
 
     @app.get("/api/v1/market/candles")
     async def market_candles(

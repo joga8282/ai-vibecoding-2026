@@ -32,10 +32,35 @@ class LiveRiskManager:
         self.reconciled = False
         self.daily_loss = Decimal(0)
         self.last_exit: dict[str, datetime] = {}
+        self.recommended_symbols: frozenset[str] = frozenset()
+        self.recommendations_at: datetime | None = None
+
+    def set_recommended_symbols(self, symbols) -> None:
+        self.recommended_symbols = frozenset(
+            str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
+        )
+        self.recommendations_at = datetime.now(timezone.utc)
+
+    def clear_recommended_symbols(self) -> None:
+        self.recommended_symbols = frozenset()
+        self.recommendations_at = None
 
     def validate(self, *, symbol: str, side: Side, quantity: Decimal, price: Decimal,
                  total_exposure: Decimal, position_count: int, quote_at: datetime,
+                 current_equity: Decimal | None = None,
                  has_opposite_open_order: bool = False, warning: bool = False) -> RiskDecision:
+        # Reject malformed inputs before comparing limits. This method sits at
+        # the future LIVE transport boundary, so invalid data must fail closed.
+        numeric_values = (quantity, price, total_exposure) + ((current_equity,) if current_equity is not None else ())
+        if any(not isinstance(value, Decimal) or not value.is_finite() for value in numeric_values):
+            return RiskDecision(False, 'invalid-order', 'Invalid numeric order data.')
+        if quantity <= 0 or price <= 0 or total_exposure < 0 or position_count < 0:
+            return RiskDecision(False, 'invalid-order', 'Quantity and price must be positive; exposure and position count cannot be negative.')
+        if side not in (Side.BUY, Side.SELL) or not isinstance(symbol, str) or not symbol.strip():
+            return RiskDecision(False, 'invalid-order', 'Order side or symbol is invalid.')
+        symbol = symbol.strip().upper()
+        if not isinstance(quote_at, datetime) or quote_at.tzinfo is None or quote_at.utcoffset() is None:
+            return RiskDecision(False, 'invalid-quote-time', 'Quote timestamp must include a timezone.')
         if not self.armed or not self.settings.live_trading_enabled:
             return RiskDecision(False, 'live-lock', '실거래 잠금이 해제되지 않았습니다.')
         if not self.reconciled:
@@ -44,21 +69,46 @@ class LiveRiskManager:
             return RiskDecision(False, 'trading-control', self.control.value)
         if side is Side.BUY and self.control is TradingControl.BUY_PAUSED:
             return RiskDecision(False, 'buy-paused', self.control.value)
-        if datetime.now(timezone.utc) - quote_at.astimezone(timezone.utc) > timedelta(seconds=10):
+        quote_age = datetime.now(timezone.utc) - quote_at.astimezone(timezone.utc)
+        if quote_age > timedelta(seconds=10) or quote_age < timedelta(seconds=-2):
             return RiskDecision(False, 'stale-quote', '시세가 10초보다 오래되었습니다.')
         if warning:
             return RiskDecision(False, 'stock-warning', '투자경고·위험 또는 거래 제한 종목입니다.')
         if has_opposite_open_order:
             return RiskDecision(False, 'opposite-open-order', '반대 방향 미체결 주문이 있습니다.')
-        if self.settings.live_allowed_symbols and symbol not in self.settings.live_allowed_symbols:
-            return RiskDecision(False, 'allowlist', '실거래 허용 종목이 아닙니다.')
+        if self.settings.live_symbol_policy == 'allowlist':
+            if not self.settings.live_allowed_symbols:
+                return RiskDecision(False, 'allowlist-not-configured', 'LIVE allowed-symbol list is empty.')
+            if symbol not in self.settings.live_allowed_symbols:
+                return RiskDecision(False, 'allowlist', '실거래 허용 종목이 아닙니다.')
+        elif self.settings.live_symbol_policy != 'recommended':
+            return RiskDecision(False, 'symbol-policy', 'Invalid LIVE symbol policy.')
+        if side is Side.BUY:
+            rec_age = (datetime.now(timezone.utc) - self.recommendations_at
+                       if self.recommendations_at is not None else None)
+            if (rec_age is None or rec_age > timedelta(minutes=5)
+                    or symbol not in self.recommended_symbols):
+                return RiskDecision(False, 'recommendation', 'A fresh qualified recommendation is required for LIVE buys.')
         amount = quantity * price
-        if amount > self.settings.live_max_order_amount_krw:
+        order_cap = self.settings.live_max_order_amount_krw
+        exposure_cap = self.settings.live_max_total_exposure_krw
+        ratio = self.settings.live_max_total_exposure_ratio
+        if (any(not isinstance(value, Decimal) or not value.is_finite() or value < 0
+                for value in (order_cap, exposure_cap, ratio)) or not 0 < ratio <= 1):
+            return RiskDecision(False, 'invalid-limits', 'Invalid LIVE investment limits.')
+        if order_cap > 0 and amount > order_cap:
             return RiskDecision(False, 'max-order', f'{amount} > {self.settings.live_max_order_amount_krw}')
-        if side is Side.BUY and total_exposure + amount > self.settings.live_max_total_exposure_krw:
+        if side is Side.BUY and exposure_cap > 0 and total_exposure + amount > exposure_cap:
             return RiskDecision(False, 'max-exposure', '전체 투자금 한도를 초과합니다.')
+        if side is Side.BUY:
+            if current_equity is None or current_equity <= 0:
+                return RiskDecision(False, 'equity-unavailable', 'Current account equity is required for the exposure ratio check.')
+            projected = total_exposure + amount
+            limit = current_equity * ratio
+            if projected > limit or (ratio < 1 and projected == limit):
+                return RiskDecision(False, 'max-equity-exposure', 'Projected LIVE exposure exceeds the configured account equity budget.')
         if side is Side.BUY and position_count >= 5:
             return RiskDecision(False, 'max-positions', '최대 보유 종목은 5개입니다.')
-        if self.daily_loss <= -self.settings.live_max_daily_loss_krw:
+        if side is Side.BUY and self.daily_loss >= self.settings.live_max_daily_loss_krw:
             return RiskDecision(False, 'daily-loss', '일일 손실 한도에 도달했습니다.')
         return RiskDecision(True, 'allowed', '모든 LIVE 리스크 검사를 통과했습니다.')
