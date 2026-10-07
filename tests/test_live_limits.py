@@ -28,6 +28,10 @@ class LiveLimitConfigTest(TestCase):
         self.assertEqual(settings.live_max_total_exposure_krw, D(0))
         self.assertEqual(settings.live_symbol_policy, 'recommended')
         self.assertFalse(settings.live_allowed_symbols)
+        self.assertEqual(settings.live_auto_max_total_exposure_ratio, D('.15'))
+        self.assertEqual(settings.manual_trade_ratio, D('.15'))
+        self.assertEqual(settings.swing_min_net_profit_percent, D(3))
+        self.assertEqual(settings.live_sell_tax_rate, D('.002'))
 
     def test_invalid_limits_and_unknown_symbol_policy_are_rejected(self):
         for changes in ({'LIVE_MAX_TOTAL_EXPOSURE_RATIO': '1.01'},
@@ -36,7 +40,17 @@ class LiveLimitConfigTest(TestCase):
                         {'LIVE_MAX_TOTAL_EXPOSURE_KRW': 'NaN'},
                         {'LIVE_MAX_DAILY_LOSS_KRW': '0'},
                         {'LIVE_SYMBOL_POLICY': 'all'},
-                        {'RECOMMENDED_TRADE_RATIO': 'NaN'}):
+                        {'RECOMMENDED_TRADE_RATIO': 'NaN'},
+                        {'LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO': '1.01'},
+                        {'LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO': 'NaN'},
+                        {'MANUAL_TRADE_RATIO': '0'},
+                        {'MANUAL_TRADE_RATIO': 'Infinity'},
+                        {'SWING_MIN_NET_PROFIT_PERCENT': '-1'},
+                        {'SWING_MIN_NET_PROFIT_PERCENT': 'NaN'},
+                        {'SWING_MIN_NET_PROFIT_PERCENT': 'abc'},
+                        {'LIVE_SELL_TAX_RATE': '-0.01'},
+                        {'LIVE_SELL_TAX_RATE': '1'},
+                        {'LIVE_SELL_TAX_RATE': 'Infinity'}):
             with self.subTest(changes=changes), self.assertRaises(RuntimeError):
                 self.settings(**changes)
 

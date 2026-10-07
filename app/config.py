@@ -42,9 +42,12 @@ class Settings:
     initial_cash_usd: Decimal = Decimal("10000")
     fee_rate: Decimal = Decimal("0.00015")
     slippage_bps: Decimal = Decimal("5")
+    swing_min_net_profit_percent: Decimal = Decimal("3")
+    live_sell_tax_rate: Decimal = Decimal("0.002")
     max_order_amount_krw: Decimal = Decimal("1000000")
     max_order_amount_usd: Decimal = Decimal("1000")
     recommended_trade_ratio: Decimal = Decimal("0.10")
+    manual_trade_ratio: Decimal = Decimal("0.15")
     engine_interval_seconds: float = 2.0
     auto_start: bool = False
     toss_market_data_enabled: bool = True
@@ -56,6 +59,7 @@ class Settings:
     live_max_order_amount_krw: Decimal = Decimal("100000")
     live_max_total_exposure_krw: Decimal = Decimal("500000")
     live_max_total_exposure_ratio: Decimal = Decimal("0.15")
+    live_auto_max_total_exposure_ratio: Decimal = Decimal("0.15")
     live_max_daily_loss_krw: Decimal = Decimal("50000")
     live_max_position_loss_percent: Decimal = Decimal("3")
     live_allowed_symbols: tuple[str, ...] = ()
@@ -68,11 +72,26 @@ class Settings:
         mode = os.getenv("TRADER_MODE", "paper").strip().lower()
         if mode not in {"paper", "live"}:
             raise RuntimeError("TRADER_MODE는 paper 또는 live여야 합니다.")
+        try:
+            min_profit = Decimal(os.getenv('SWING_MIN_NET_PROFIT_PERCENT', '3'))
+            sell_tax = Decimal(os.getenv('LIVE_SELL_TAX_RATE', '0.002'))
+        except ArithmeticError as exc:
+            raise RuntimeError('Swing profit and sell-tax settings must be numbers.') from exc
+        if not min_profit.is_finite() or not Decimal(0) <= min_profit <= Decimal(100):
+            raise RuntimeError('SWING_MIN_NET_PROFIT_PERCENT must be between 0 and 100.')
+        if not sell_tax.is_finite() or not Decimal(0) <= sell_tax < Decimal(1):
+            raise RuntimeError('LIVE_SELL_TAX_RATE must be between 0 and 1 (exclusive).')
         recommended_trade_ratio = Decimal(
             os.getenv("RECOMMENDED_TRADE_RATIO", "0.10")
         )
         if not recommended_trade_ratio.is_finite() or not Decimal("0") <= recommended_trade_ratio <= Decimal("1"):
             raise RuntimeError("RECOMMENDED_TRADE_RATIO는 0부터 1 사이여야 합니다.")
+        manual_trade_ratio = Decimal(os.getenv("MANUAL_TRADE_RATIO", "0.15"))
+        auto_max_ratio = Decimal(os.getenv("LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO", "0.15"))
+        for name, value in (("MANUAL_TRADE_RATIO", manual_trade_ratio),
+                            ("LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO", auto_max_ratio)):
+            if not value.is_finite() or not Decimal('.01') <= value <= Decimal(1):
+                raise RuntimeError(f"{name} must be between 0.01 and 1.")
         database_path = Path(os.getenv(
             "LIVE_DATABASE_PATH" if mode == "live" else "DATABASE_PATH",
             "data/live_trader.db" if mode == "live" else "data/auto_trader.db",
@@ -115,9 +134,12 @@ class Settings:
             initial_cash_usd=Decimal(os.getenv("INITIAL_CASH_USD", "10000")),
             fee_rate=Decimal(os.getenv("FEE_RATE", "0.00015")),
             slippage_bps=Decimal(os.getenv("SLIPPAGE_BPS", "5")),
+            swing_min_net_profit_percent=min_profit,
+            live_sell_tax_rate=sell_tax,
             max_order_amount_krw=Decimal(os.getenv("MAX_ORDER_AMOUNT_KRW", "1000000")),
             max_order_amount_usd=Decimal(os.getenv("MAX_ORDER_AMOUNT_USD", "1000")),
             recommended_trade_ratio=recommended_trade_ratio,
+            manual_trade_ratio=manual_trade_ratio,
             engine_interval_seconds=float(os.getenv("ENGINE_INTERVAL_SECONDS", "2")),
             auto_start=_as_bool(os.getenv("AUTO_START")),
             toss_market_data_enabled=_as_bool(
@@ -131,6 +153,7 @@ class Settings:
             live_max_order_amount_krw=live_limits["LIVE_MAX_ORDER_AMOUNT_KRW"],
             live_max_total_exposure_krw=live_limits["LIVE_MAX_TOTAL_EXPOSURE_KRW"],
             live_max_total_exposure_ratio=live_limits["LIVE_MAX_TOTAL_EXPOSURE_RATIO"],
+            live_auto_max_total_exposure_ratio=auto_max_ratio,
             live_max_daily_loss_krw=live_limits["LIVE_MAX_DAILY_LOSS_KRW"],
             live_max_position_loss_percent=live_limits["LIVE_MAX_POSITION_LOSS_PERCENT"],
             live_allowed_symbols=tuple(filter(None, (s.strip().upper() for s in os.getenv("LIVE_ALLOWED_SYMBOLS", "").split(',')))),

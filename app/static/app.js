@@ -133,16 +133,27 @@ function renderStatus(status, risk) {
     ? `오류: ${status.last_error}`
     : [status.automation?.execution_state, status.automation?.message].filter(Boolean).join(" · ") || `v${status.version} · ${status.market_data.toUpperCase()} 시세`;
   if (status.mode === "live" && !status.live_readiness?.reconciled) {
+    $("#engineLabel").textContent = "LIVE 주문 잠금";
     $("#engineDetail").textContent = "LIVE 계좌 동기화 실패 또는 미완료 · 연결을 복구한 뒤 다시 동기화하세요.";
   } else if (status.mode === "live" && !status.live_readiness?.armed) {
-    $("#engineDetail").textContent = "LIVE 자동 실행은 계좌 동기화와 별도 수동 무장 후에만 가능합니다.";
+    $("#engineLabel").textContent = "LIVE 주문 잠금";
+    const unresolved = Number(status.live_readiness?.unresolved_order_count || 0);
+    $("#engineDetail").textContent = unresolved > 0
+      ? `미확인 주문 ${unresolved}건 · 접수 여부를 확인한 뒤 계좌 동기화·무장을 진행하세요.`
+      : "LIVE 자동 실행은 계좌 동기화와 별도 수동 무장 후에만 가능합니다.";
+  }
+  if (status.mode === "live" && status.live_readiness?.last_order_error) {
+    $("#engineDetail").textContent += ` · ${status.live_readiness.last_order_error}`;
   }
   const auto = status.automation;
+  const minProfit = Number(risk?.swing_exit_policy?.min_net_profit_percent ?? 3);
+  $("#strategyExitValue").textContent = `상단 + 예상 순수익 ${minProfit}% 이상 익절`;
+  $("#strategyExitHelp").textContent = `추적 기준에서 순수익 ${minProfit}% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도는 ${minProfit}% 미만에서도 가능 · 평균 매입가 -3% 손절`;
   if ($("#signalObservationCount")) $("#signalObservationCount").textContent = `${number(auto?.signal_observation_count || 0, "KRW")}건`;
   renderDiagnostics(auto?.diagnostics);
   $("#autoBudgetStatus").textContent = auto && Number(auto.budget) > 0
     ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 ${status.mode === "live" ? "평가액" : "원가"} ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
-    : "최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 또는 터치 후 -2% 매도";
+    : `최대 5종목 · -3% 손절 · 상단 + 예상 순수익 ${minProfit}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도`;
   const weekly = auto?.weekly;
   $("#scalpSummary").textContent = weekly ? `누적 실현손익 ${money(weekly.realized_profit, "KRW")} · 청산 매수원가 대비 ${weekly.return_percent ?? "-"}% · 보유 중 제외` : "기록 대기";
   $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)} · ${escapeHtml(day.name || day.symbol || "")}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
@@ -152,7 +163,8 @@ function renderStatus(status, risk) {
   liveArmButton.textContent = status.live_readiness?.armed ? "LIVE 무장 해제" : "LIVE 계좌 동기화·무장";
   liveArmButton.disabled = status.running || status.kill_switch;
   if (status.mode === "live") {
-    $("#startButton").textContent = status.running ? "LIVE 자동매매 실행 중" : "LIVE 자동매매 시작";
+    $("#startButton").textContent = status.running && status.live_readiness?.armed
+      && status.live_readiness?.reconciled ? "LIVE 자동매매 실행 중" : "LIVE 자동매매 시작";
   }
   const liveNotReady = status.mode === "live"
     && !(status.live_readiness?.reconciled && status.live_readiness?.armed);
@@ -175,12 +187,14 @@ function renderStatus(status, risk) {
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
   $("#capitalMode").textContent = isPaper ? "PAPER" : "LIVE";
   $("#investmentSettingsButton").disabled = false;
-  const maxRatio = isPaper ? 50 : Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15) * 100;
+  const maxRatio = isPaper ? 50 : Math.min(Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15),
+    Number(risk?.live_limits?.auto_max_total_exposure_ratio ?? 0.15)) * 100;
   $("#investmentRatioInput").max = String(maxRatio);
   $("#capitalRatioInput").max = String(maxRatio);
+  $("#manualRatioInput").max = String(isPaper ? 100 : Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15) * 100);
   $("#investmentRatioHelp").textContent = isPaper
     ? "매수 신호가 오면 설정한 자산 비율과 가용 현금으로 주문합니다. 최대 5종목을 보유합니다."
-    : `LIVE 매수 후 보유 평가액과 미체결 매수의 합계에 ${liveExposureLabel(risk?.live_limits)}를 적용합니다. ${risk?.live_limits?.symbol_policy === "recommended" ? "최신 추천 조건 통과 종목만 매수합니다." : "종목 허용목록도 적용합니다."} 주문 수량은 가용 현금과 수수료로 계산합니다.`;
+    : `총 투자예산을 최대 5종목에 균등 배분하여 종목당 1/5 이내에서 매수합니다. 보유 평가액·미체결 매수 합계에 ${liveExposureLabel(risk?.live_limits)}를 적용합니다. ${risk?.live_limits?.symbol_policy === "recommended" ? "최신 추천 조건 통과 종목만 매수합니다." : "종목 허용목록도 적용합니다."} 가용 현금·수수료를 적용하며 1주 예산이 부족한 종목은 건너뜁니다.`;
   $("#tradingHoursHelp").textContent = `평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00 · 5분 간격 확인 · ${isPaper ? "PAPER" : "LIVE 실계좌"} 주문`;
   $("#strategyCapitalHelp").textContent = isPaper ? "1회 매수 비율 설정 · PAPER" : `${liveExposureLabel(risk?.live_limits)} · LIVE`;
   $("#screeningEyebrow").textContent = isPaper ? "PAPER SCREENING" : "LIVE SCREENING";
@@ -266,6 +280,9 @@ function renderCapital(account, risk, status, performance) {
   $("#capitalRatioInput").value = String(Math.round(tradeRatio * 100));
   $("#capitalRatioInput").disabled = false;
   $("#capitalRatioValue").textContent = `${ratioPercent}%`;
+  $("#manualRatioInput").value = String(Number(risk.manual_trade_ratio ?? 0.15) * 100);
+  $("#manualRatioInput").disabled = false;
+  previewManualRatio($("#manualRatioInput").value);
   $("#capitalRatioPreview").textContent = `${money(Math.min(availableCash, accountAmount * tradeRatio), "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;
   $("#capitalTitle").textContent = isPaper ? "가상계좌 주문 자금" : "실계좌 주문 자금";
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
@@ -278,7 +295,8 @@ function renderCapital(account, risk, status, performance) {
     : `평가금액의 ${ratioPercent}%를 스윙 예산으로 사용 · 최대 5종목 · 종목별 주문 한도 적용`;
   $("#capitalRecommendationHelp").textContent = `총평가금액의 ${ratioPercent}%를 1회 매수 목표로 사용 · 분할매수 없음 · 최대 5종목`;
   if (!isPaper) {
-    $("#capitalRecommendationHelp").textContent = `${liveExposureLabel(risk.live_limits)}에서 보유 평가액·미체결 매수를 차감 · 1회 주문은 ${liveOrderLimitLabel(risk.live_limits)}`;
+    const perSymbol = Number(status.automation?.per_symbol_budget || recommendationAmount / 5);
+    $("#capitalRecommendationHelp").textContent = `자동매매 총자산의 ${ratioPercent}% 예산에서 보유 평가액·미체결 매수를 차감 · 종목당 총 투자예산의 1/5, 현재 최대 ${money(perSymbol, "KRW")} · ${liveExposureLabel(risk.live_limits)} · ${liveOrderLimitLabel(risk.live_limits)}`;
     $("#capitalRatioPreview").textContent = `${money(recommendationAmount, "KRW")} 현재 추가 매수 가능 예산`;
   }
 }
@@ -290,8 +308,46 @@ function buyBlockReason(symbol) {
   if (!(state.status.live_readiness?.armed && state.status.live_readiness?.reconciled)) return "LIVE 동기화·무장 필요";
   if (state.risk?.live_limits?.symbol_policy !== "recommended"
       && !state.risk?.live_limits?.allowed_symbols?.includes(symbol)) return "LIVE 허용목록에 없음";
-  if (Number(state.status.automation.remaining) <= 0) return "추가 매수 한도 없음";
+  if (Number(state.status.automation.manual_buy_capacity ?? state.status.automation.remaining) <= 0) return "추가 매수 한도 없음";
   return "";
+}
+
+function candidateBuyBlockReason(item) {
+  const blocked = buyBlockReason(item.symbol);
+  if (blocked || state.status?.mode !== "live") return blocked;
+  if (state.account?.positions?.some(position => position.symbol === item.symbol)) return "보유 중 · 추가 매수 없음";
+  return manualQuantity(item) < 1 ? "직접 매수 예산으로 1주 매수 불가" : "";
+}
+
+function manualRatioPercent() {
+  return Number($("#manualRatioInput").value || Number(state.risk?.manual_trade_ratio ?? 0.15) * 100);
+}
+
+function manualBuyAmount(percent = manualRatioPercent()) {
+  const equity = Number(state.account?.total_equity?.KRW || 0);
+  const cash = Number(state.account?.cash?.KRW || 0);
+  const selected = equity * Number(percent) / 100;
+  if (state.status?.mode !== "live") return Math.max(0, Math.min(cash, selected));
+  const capacity = Number(state.status?.automation?.manual_buy_capacity ?? state.status?.automation?.remaining ?? 0);
+  return Math.max(0, Math.min(cash, selected, capacity));
+}
+
+function manualQuantity(item) {
+  // Preview uses the displayed price; the server rechecks the actual ask and fees.
+  if (!state.account) return Number(item.quantity || 0);
+  const price = Number(item.price || 0);
+  if (!(price > 0)) return 0;
+  const live = state.status?.mode === "live";
+  const fill = price * (live ? 1 : 1 + Number(state.risk?.slippage_bps || 0) / 10000);
+  let quantity = Math.floor(manualBuyAmount() / (fill * (1 + Number(state.risk?.fee_rate || 0))));
+  const cap = Number(live ? state.risk?.live_limits?.max_order_amount_krw : state.risk?.max_order_amount?.KRW);
+  if (cap > 0) quantity = Math.min(quantity, Math.floor(cap / fill));
+  return quantity;
+}
+
+function previewManualRatio(percent) {
+  $("#manualRatioValue").textContent = `${percent}%`;
+  $("#manualRatioPreview").textContent = `직접 매수 1회 예상 예산 ${money(manualBuyAmount(percent), "KRW")} · 총자산의 ${percent}% 이내 · 보유·미체결·가용 현금·주문 한도 재검사`;
 }
 
 function renderRecommendations(payload, scroll = true) {
@@ -303,13 +359,13 @@ function renderRecommendations(payload, scroll = true) {
   const funnel = payload.funnel || {};
   $("#recommendationFunnel").textContent = `${new Date().toLocaleTimeString("ko-KR")} 조회 완료 · 등록 테마 ${number(funnel.universe || 0, "KRW")}개 → 시세 확인 ${number(funnel.budget_liquidity || 0, "KRW")}개 → 대형주 필터 ${number(funnel.risk_filtered || 0, "KRW")}개 → 지표 분석 ${number(funnel.analyzed || 0, "KRW")}개 → 조건 충족 ${number(funnel.qualified ?? payload.candidates.length, "KRW")}개`;
   $("#recommendationList").innerHTML = payload.candidates.length
-    ? `<h3 class="result-heading">자동 매수 조건 통과</h3>` + payload.candidates.map((item, index) => `<article class="recommendation-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
+    ? `<h3 class="result-heading">매수 자리 도달 · 자동 매수 조건 통과</h3>` + payload.candidates.map((item, index) => `<article class="recommendation-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
         <div class="recommendation-rank">#${index + 1} · <strong>${item.score}점</strong></div>
         <h3 title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</h3>
         <span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
         <div class="recommendation-metrics">
-          ${String(item.strategy || "").startsWith("swing-v") ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>4시간봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 3% 이내 매수 구간</div><div>손절 평균 매입가 -3% · 4시간봉 상단 또는 터치 후 최고가 -2% 매도</div><div>주봉 MA10 ${number(item.weekly_ma10, item.currency)} · 일봉 MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>주봉·일봉 방향 확인 · 최대 5종목 · 다일 보유</div>` : `
+          ${String(item.strategy || "").startsWith("swing-v") ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>주봉 관심 가격 ${number(item.weekly_support_floor, item.currency)} ~ ${number(item.weekly_entry_ceiling, item.currency)} · 최근 20주 하위 40%</div><div>4시간봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 밴드 하위 25% 및 하단 3% 이내</div><div>최근 20일 고저 범위 하위 40% · 최종 매수 상한 ${number(item.entry_ceiling, item.currency)}</div><div>손절 평균 매입가 -3% · 상단 + 예상 순수익 ${Number(state.risk?.swing_exit_policy?.min_net_profit_percent ?? 3)}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도</div><div>주봉 MA10 ${number(item.weekly_ma10, item.currency)} · 일봉 MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>주봉·일봉 방향 확인 · 최대 5종목 · 다일 보유</div>` : `
           <div>시가총액 ${marketCap(item.market_cap)}</div>
           <div>일봉 지지 ${number(item.daily_support, item.currency)} · 저항 ${number(item.daily_resistance, item.currency)}</div>
           <div>주봉 지지 ${number(item.weekly_support, item.currency)} · 저항 ${number(item.weekly_resistance, item.currency)}</div>
@@ -324,17 +380,17 @@ function renderRecommendations(payload, scroll = true) {
           `}
         </div>
         <p class="recommendation-reason">${escapeHtml(item.reason)}</p>
-        <div class="recommendation-quantity">종목별 배분·주문 한도 적용 시 최대 ${number(item.quantity, "KRW")}주</div>
-        <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${buyBlockReason(item.symbol) ? "disabled" : ""}>${escapeHtml(buyBlockReason(item.symbol) || (state.status?.mode === "live" ? "LIVE 실계좌 조건 확인·매수" : "조건 통과 종목 자산 비율 매수"))}</button>
+        <div class="recommendation-quantity">자동 배분 최대 ${number(item.quantity, "KRW")}주 · 직접 ${manualRatioPercent()}% 선택 시 예상 ${number(manualQuantity(item), "KRW")}주</div>
+        <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${candidateBuyBlockReason(item) ? "disabled" : ""}>${escapeHtml(candidateBuyBlockReason(item) || (state.status?.mode === "live" ? "LIVE 실계좌 조건 확인·매수" : "조건 통과 종목 자산 비율 매수"))}</button>
       </article>`).join("")
     : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
   const watchlist = payload.watchlist || [];
   $("#recommendationWatchlist").innerHTML = watchlist.length
-    ? `<h3 class="result-heading">조건 근접 관찰 후보 <small>자동 매수 안 함</small></h3><div class="recommendation-list">${watchlist.map((item, index) => `<article class="recommendation-card watch-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
+    ? `<h3 class="result-heading">매수 자리 근접 · 조건 대기 <small>매수 추천 아님 · 자동 매수 안 함</small></h3><div class="recommendation-list">${watchlist.map((item, index) => `<article class="recommendation-card watch-card" data-chart-symbol="${escapeHtml(item.symbol)}" data-chart-name="${escapeHtml(item.name)}" tabindex="0" role="button" aria-label="${escapeHtml(item.name)} 차트 보기">
         <div class="recommendation-rank">관찰 #${index + 1} · <strong>${item.conditions_passed}/${item.conditions_total} 조건 통과</strong></div>
         <h3>${escapeHtml(item.name)}</h3><span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
-        <div class="recommendation-metrics"><div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 현재가 거리 ${escapeHtml(item.band_distance_percent)}%</div></div>
+        <div class="recommendation-metrics"><div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>주봉 관심 가격 ${number(item.weekly_support_floor, item.currency)} ~ ${number(item.weekly_entry_ceiling, item.currency)} · 주봉 범위 내 위치 ${escapeHtml(item.weekly_range_position_percent ?? "-")}%</div><div>MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 현재가 거리 ${escapeHtml(item.band_distance_percent)}%</div><div>4시간 밴드 내 위치 ${escapeHtml(item.four_hour_band_position_percent ?? "-")}% · 최근 20일 범위 내 위치 ${escapeHtml(item.daily_range_position_percent ?? "-")}%</div><div>매수 상한 ${number(item.entry_ceiling, item.currency)} · 주봉·일봉·4시간 조건 확인</div></div>
         <p class="recommendation-reason">미충족: ${escapeHtml((item.rejection_reasons || []).join(" · "))}</p>
         ${state.status?.mode === "paper" ? `<button type="button" class="button button-secondary full" data-test-buy="${escapeHtml(item.symbol)}" ${state.status?.automation?.market_open ? "" : "disabled"}>1주 PAPER 테스트 매수</button>` : '<p class="muted">조건 미충족 · LIVE 매수 불가</p>'}
       </article>`).join("")}</div>`
@@ -344,6 +400,22 @@ function renderRecommendations(payload, scroll = true) {
 
 const chartState = { symbol: null, name: null, interval: "1d" };
 const chartLabels = { "1d": "일봉", "1w": "주봉", "1M": "월봉", "15m": "15분봉", "30m": "30분봉", "60m": "60분봉", "4h": "4시간봉" };
+
+function fourHourCandleCompleted(timestamp, now) {
+  const offset = 9 * 60 * 60 * 1000;
+  const local = new Date(new Date(timestamp).getTime() + offset);
+  const morning = local.getUTCHours() < 13;
+  const end = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(),
+    morning ? 13 : 15, morning ? 0 : 30) - offset;
+  return end <= now.getTime();
+}
+
+function kstWeekStart(timestamp) {
+  const offset = 9 * 60 * 60 * 1000;
+  const local = new Date(new Date(timestamp).getTime() + offset);
+  const mondayOffset = (local.getUTCDay() + 6) % 7;
+  return Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() - mondayOffset) - offset;
+}
 
 function renderCandlestickChart(candles, interval, dailyCandles = []) {
   const canvas = $("#candidateChartCanvas");
@@ -374,7 +446,27 @@ function renderCandlestickChart(candles, interval, dailyCandles = []) {
     }
     dailyAverages.set(new Date(candle.timestamp).toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" }), values);
   });
-  const averagesFor = candle => dailyAverages.get(new Date(candle.timestamp).toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" })) || {};
+  const intervalBands = new Map();
+  if (["4h", "1w"].includes(interval)) {
+    const period = interval === "4h" ? 6 : 20;
+    const now = new Date(), completedCloses = [];
+    rows.forEach(candle => {
+      const completed = interval === "4h" ? fourHourCandleCompleted(candle.timestamp, now)
+        : kstWeekStart(candle.timestamp) < kstWeekStart(now);
+      if (completed) completedCloses.push(Number(candle.close_price));
+      if (completedCloses.length < period) return;
+      const window = completedCloses.slice(-period);
+      const middle = window.reduce((sum, value) => sum + value, 0) / period;
+      const deviation = Math.sqrt(window.reduce((sum, value) => sum + (value - middle) ** 2, 0) / period);
+      intervalBands.set(candle.timestamp, {bollingerUpper: middle + 2 * deviation, bollingerLower: middle - 2 * deviation});
+    });
+  }
+  const averagesFor = candle => {
+    const values = dailyAverages.get(new Date(candle.timestamp).toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" })) || {};
+    if (!["4h", "1w"].includes(interval)) return values;
+    const {bollingerUpper, bollingerLower, ...dailyMA} = values;
+    return {...dailyMA, ...(intervalBands.get(candle.timestamp) || {})};
+  };
   const width = 960, height = 470, left = 18, right = 78, top = 42, priceBottom = 326, volumeTop = 350, volumeBottom = 430, bottom = 30;
   const plotWidth = width - left - right, plotHeight = priceBottom - top;
   const highs = rows.map(c => Number(c.high_price));
@@ -386,6 +478,23 @@ function renderCandlestickChart(candles, interval, dailyCandles = []) {
   const y = value => top + (maximum - value) / (maximum - minimum) * plotHeight;
   const step = plotWidth / rows.length;
   const bodyWidth = Math.max(2, Math.min(10, step * .62));
+  let weeklyZone = "";
+  if (interval === "1w") {
+    const completed = rows.filter(candle => kstWeekStart(candle.timestamp) < kstWeekStart(new Date())).slice(-20);
+    if (completed.length === 20 && completed.every(c => Number.isFinite(Number(c.low_price))
+        && Number.isFinite(Number(c.high_price)) && Number(c.low_price) > 0
+        && Number(c.low_price) <= Number(c.close_price) && Number(c.close_price) <= Number(c.high_price))) {
+      const low = Math.min(...completed.map(c => Number(c.low_price)));
+      const high = Math.max(...completed.map(c => Number(c.high_price)));
+      if (high > low) {
+        const ceiling = low + (high - low) * .4, floor = low * .97;
+        const zoneTop = Math.max(top, Math.min(priceBottom, y(ceiling)));
+        const zoneBottom = Math.max(top, Math.min(priceBottom, y(floor)));
+        const zoneLeft = left + step * rows.indexOf(completed[0]);
+        weeklyZone = `<g class="weekly-entry-zone"><title>최근 20개 완료 주봉으로 계산한 현재 관심 가격 · 하위 40% · 저점 3% 하회 제외 · 일봉·4시간 조건도 통과해야 매수 추천</title><rect x="${zoneLeft}" y="${zoneTop}" width="${width-right-zoneLeft}" height="${zoneBottom-zoneTop}" fill="#25c2a0" opacity=".12"/><line x1="${zoneLeft}" y1="${zoneTop}" x2="${width-right}" y2="${zoneTop}" style="stroke:#25c2a0;stroke-dasharray:5 4"/><text x="${zoneLeft+8}" y="${Math.max(top+14, zoneTop-6)}" class="chart-axis" style="fill:#25c2a0">현재 주봉 매수 관심 ${number(floor, "KRW")} ~ ${number(ceiling, "KRW")}</text></g>`;
+      }
+    }
+  }
   const grid = Array.from({ length: 5 }, (_, index) => {
     const value = maximum - (maximum - minimum) * index / 4;
     const py = y(value);
@@ -437,7 +546,8 @@ function renderCandlestickChart(candles, interval, dailyCandles = []) {
     }).filter(Boolean).join(" ");
     return points ? `<polyline class="moving-average" style="stroke:${color};stroke-width:2.4" points="${points}"/>` : "";
   }).join("");
-  const legend = [...periods.map(period => ({ label: `MA${period}`, color: maColors[period] })), { label: "BB 상단", color: "#4d65ff" }, { label: "BB 하단", color: "#f2c500" }]
+  const bandLabel = interval === "4h" ? "BB6" : interval === "1w" ? "주 BB20" : "일 BB20";
+  const legend = [...periods.map(period => ({ label: `일 MA${period}`, color: maColors[period] })), { label: `${bandLabel} 상단`, color: "#4d65ff" }, { label: `${bandLabel} 하단`, color: "#f2c500" }]
     .map((item, index) => `<g transform="translate(${left + index * 105},18)"><line x1="0" y1="0" x2="18" y2="0" style="stroke:${item.color};stroke-width:2"/><text x="24" y="4" class="chart-legend">${item.label}</text></g>`).join("");
   const labelIndexes = [...new Set([0, Math.floor((rows.length-1)/2), rows.length-1])];
   const dateLabels = labelIndexes.map(index => {
@@ -451,8 +561,10 @@ function renderCandlestickChart(candles, interval, dailyCandles = []) {
   const first = Number(rows[0].open_price), last = Number(rows.at(-1).close_price);
   const change = first ? (last / first - 1) * 100 : 0;
   const candleCountLabel = interval === "4h" ? `${rows.length}개 확보 / 최대 50개 요청` : `${rows.length}개`;
-  $("#candidateChartMeta").textContent = `${chartLabels[interval]} · ${candleCountLabel} · 구간 ${change >= 0 ? "+" : ""}${change.toFixed(2)}% · 캔들에 마우스를 올리면 OHLC 확인`;
-  canvas.innerHTML = `<svg class="price-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(chartState.name)} ${chartLabels[interval]} 캔들·거래량·이동평균·볼린저밴드 차트">${legend}${grid}${bandLines}${averageLines}${bodies}<line x1="${left}" y1="${volumeTop-10}" x2="${width-right}" y2="${volumeTop-10}" class="chart-grid"/><text x="${left}" y="${volumeTop-15}" class="chart-axis">거래량</text>${volumeBars}${dateLabels}</svg>`;
+  const bandMeta = interval === "4h" ? "4시간 BB(6,2) · 완료봉 기준"
+    : interval === "1w" ? "주봉 BB(20,2) · 완료봉 기준 · 녹색은 20주 매수 관심 구간" : "일봉 BB(20,2)";
+  $("#candidateChartMeta").textContent = `${chartLabels[interval]} · ${candleCountLabel} · ${bandMeta} · 이동평균은 일봉 기준 · 구간 ${change >= 0 ? "+" : ""}${change.toFixed(2)}% · 캔들에 마우스를 올리면 OHLC 확인`;
+  canvas.innerHTML = `<svg class="price-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(chartState.name)} ${chartLabels[interval]} 캔들·거래량·이동평균·볼린저밴드 차트">${legend}${grid}${weeklyZone}${bandLines}${averageLines}${bodies}<line x1="${left}" y1="${volumeTop-10}" x2="${width-right}" y2="${volumeTop-10}" class="chart-grid"/><text x="${left}" y="${volumeTop-15}" class="chart-axis">거래량</text>${volumeBars}${dateLabels}</svg>`;
 }
 
 async function loadCandidateChart(symbol, name, interval = "1d") {
@@ -589,6 +701,27 @@ function renderQuotes(quotes) {
   </div>`).join("") : '<p class="empty">수신한 시세가 없습니다.</p>';
 }
 
+function renderOrderReview(orders) {
+  $("#liveOrderReview").hidden = !orders.length;
+  $("#liveOrderReviewList").innerHTML = orders.map(order => {
+    const canReview = order.status === "UNKNOWN" && !order.has_broker_id && !state.status?.running;
+    return `<div class="control-row"><span>${escapeHtml(order.symbol)} · ${escapeHtml(order.side)} · ${escapeHtml(order.quantity)}주 · ${escapeHtml(order.status)}${order.error_code ? ` · ${escapeHtml(order.error_code)}` : ""}</span><button class="button button-secondary" type="button" data-review-unsubmitted="${escapeHtml(order.client_order_id)}" ${canReview ? "" : "disabled"}>토스 내역 확인 후 미접수 정리</button></div>`;
+  }).join("");
+}
+
+$("#liveOrderReviewList").addEventListener("click", async event => {
+  const button = event.target.closest("button[data-review-unsubmitted]");
+  if (!button || button.disabled) return;
+  if (!confirm("토스 앱 주문내역에서 이 주문이 접수·체결되지 않았음을 직접 확인했나요? 서버에서도 미체결·종료 주문을 조회한 뒤 미접수로 정리합니다. 실제 주문은 전송하지 않습니다.")) return;
+  button.disabled = true;
+  try {
+    await request(`${API}/live/order-review/confirm-unsubmitted`, {method: "POST",
+      body: JSON.stringify({client_order_id: button.dataset.reviewUnsubmitted, confirm_no_broker_order: true})});
+    toast("미접수 확인을 기록했습니다. 계좌 동기화·무장 후 시작할 수 있습니다.");
+    await loadAll(true);
+  } catch (error) { button.disabled = false; toast(error.message, true); }
+});
+
 async function loadAll(silent = false) {
   try {
     const previousStatus = state.status || await request(`${API}/system/status`);
@@ -607,6 +740,12 @@ async function loadAll(silent = false) {
     const risk = await request(`${API}/risk/status`);
     state.risk = risk;
     renderStatus(status, risk);
+    if (status.mode === "live") {
+      const review = await request(`${API}/live/order-review`);
+      renderOrderReview(review.orders || []);
+    } else {
+      renderOrderReview([]);
+    }
     const accountPath = status.mode === "live" ? `${API}/live/account` : `${API}/paper/account`;
     const [account, performance, orders, quotes] = await Promise.all([
       request(accountPath), request(`${API}/performance`), request(`${API}/orders`),
@@ -664,12 +803,27 @@ $("#capitalRatioInput").addEventListener("change", async event => {
   slider.disabled = true;
   try {
     await saveInvestmentRatio(Number(slider.value));
-    toast(`1회 매수 비율을 ${slider.value}%로 저장했습니다.`);
+    toast(`총 투자예산 비율을 ${slider.value}%로 저장했습니다.`);
     await loadAll(true);
   } catch (error) {
     toast(error.message, true);
     await loadAll(true);
   }
+});
+$("#manualRatioInput").addEventListener("input", event => {
+  previewManualRatio(event.currentTarget.value);
+  if (state.recommendations) renderRecommendations(state.recommendations, false);
+});
+$("#manualRatioInput").addEventListener("change", async event => {
+  const slider = event.currentTarget;
+  slider.disabled = true;
+  try {
+    await request(`${API}/settings/manual-investment-ratio`, {
+      method: "PUT", body: JSON.stringify({ ratio_percent: Number(slider.value) }),
+    });
+    toast(`직접 매수 비율을 ${slider.value}%로 저장했습니다.`);
+  } catch (error) { toast(error.message, true); }
+  finally { await loadAll(true); slider.disabled = false; }
 });
 $("#investmentSettingsClose").addEventListener("click", () => investmentSettingsDialog.close());
 $("#investmentSettingsCancel").addEventListener("click", () => investmentSettingsDialog.close());
@@ -681,7 +835,7 @@ $("#investmentSettingsForm").addEventListener("submit", async event => {
     const ratioPercent = Number($("#investmentRatioInput").value);
     await saveInvestmentRatio(ratioPercent);
     investmentSettingsDialog.close();
-    toast(`1회 매수 비율을 ${ratioPercent}%로 저장했습니다.`);
+    toast(`총 투자예산 비율을 ${ratioPercent}%로 저장했습니다.`);
     await loadAll(true);
   } catch (error) {
     toast(error.message, true);
@@ -737,12 +891,13 @@ $("#recommendationList").addEventListener("click", async (event) => {
   const symbol = button.dataset.qualifiedBuy;
   const live = state.status?.mode === "live";
   if (buyBlockReason(symbol)) return;
-  if (!confirm(`${symbol}: 매수 조건과 예산을 다시 확인하고 ${live ? "실계좌 시장가" : "PAPER"} 매수할까요?${live ? ` ${liveExposureLabel(state.risk?.live_limits)}와 최신 추천·가용 현금 기준을 적용합니다.` : ""}`)) return;
+  const ratioPercent = manualRatioPercent();
+  if (!confirm(`${symbol}: 총자산의 ${ratioPercent}% 이내, 예상 예산 ${money(manualBuyAmount(ratioPercent), "KRW")}으로 조건을 다시 확인하고 ${live ? "실계좌 시장가" : "PAPER"} 매수할까요?${live ? ` ${liveExposureLabel(state.risk?.live_limits)}와 최신 추천·가용 현금 기준을 적용합니다.` : ""}`)) return;
   button.disabled = true;
   button.textContent = live ? "LIVE 매수 확인 중…" : "PAPER 매수 중…";
   try {
     const result = await request(`${API}/${live ? "live" : "paper"}/qualified-buy/${encodeURIComponent(symbol)}`, {
-      method: "POST", ...(live ? { body: JSON.stringify({ confirm_real_order: true }) } : {}),
+      method: "POST", body: JSON.stringify({ ratio_percent: ratioPercent, ...(live ? { confirm_real_order: true } : {}) }),
     });
     toast(`${symbol} ${result.message}`);
   } catch (error) {

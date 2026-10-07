@@ -7,6 +7,7 @@ from app.morning_trader import MorningTrader, KST
 from app.models import Currency, Side, OrderStatus
 from app.paper import PaperBroker
 from app.swing_signals import four_hour_exit_signal, swing_signal, trend_context
+from app.swing_profit import estimate_exit_profit
 from app.swing_universe import load_universe, membership
 
 
@@ -74,7 +75,9 @@ class SwingTrader(MorningTrader):
         budget = max(D(0), D(account['total_equity']['KRW']) * self.engine.settings.recommended_trade_ratio)
         if self.engine.settings.mode == 'live':
             broker = self.engine.broker
-            budget = min(budget, D(account['total_equity']['KRW']) * self.engine.settings.live_max_total_exposure_ratio)
+            budget = min(budget, D(account['total_equity']['KRW']) * min(
+                self.engine.settings.live_max_total_exposure_ratio,
+                self.engine.settings.live_auto_max_total_exposure_ratio))
             if self.engine.settings.live_max_total_exposure_krw > 0:
                 budget = min(budget, self.engine.settings.live_max_total_exposure_krw)
             invested = sum(broker.position_market_values.values(), D(0))
@@ -88,6 +91,47 @@ class SwingTrader(MorningTrader):
         if len(self.engine.broker.positions) >= 5:
             remaining = D(0)
         return budget, invested, remaining
+
+    def buy_budget(self, symbol=None):
+        """Reserve one of five equal LIVE allocations, including fees."""
+        budget, _, remaining = self.capital()
+        if self.engine.settings.mode != 'live':
+            return remaining
+        broker = self.engine.broker
+        reserved = set(broker.positions) | {
+            str(order.get('symbol', '')).upper() for order in broker.open_orders
+            if str(order.get('side', '')).upper() == 'BUY'
+        }
+        if len(reserved) >= 5 or (symbol and symbol.upper() in reserved):
+            return D(0)
+        return max(D(0), min(remaining, budget / D(5)))
+
+    def manual_buy_budget(self, symbol=None, ratio=None):
+        """Size a direct buy independently, within aggregate exposure and cash."""
+        settings, broker = self.engine.settings, self.engine.broker
+        ratio = settings.manual_trade_ratio if ratio is None else D(str(ratio))
+        maximum = settings.live_max_total_exposure_ratio if settings.mode == 'live' else D(1)
+        if not ratio.is_finite() or not D('.01') <= ratio <= maximum:
+            raise RuntimeError(f'직접 매수 비율은 1%부터 {maximum * 100:g}% 사이여야 합니다.')
+        account = broker.account(self.engine.quotes)
+        equity, cash = D(account['total_equity']['KRW']), D(account['cash']['KRW'])
+        budget = max(D(0), equity * ratio)
+        if settings.mode != 'live':
+            return min(cash, budget)
+        reserved = set(broker.positions) | {
+            str(order.get('symbol', '')).upper() for order in broker.open_orders
+            if str(order.get('side', '')).upper() == 'BUY'
+        }
+        pending = broker._pending_buy_exposure()
+        if (pending is None or not broker.reconciled or len(reserved) >= 5
+                or (symbol and symbol.upper() in reserved)):
+            return D(0)
+        exposure_limit = equity * settings.live_max_total_exposure_ratio
+        if settings.live_max_total_exposure_krw > 0:
+            exposure_limit = min(exposure_limit, settings.live_max_total_exposure_krw)
+        invested = sum(broker.position_market_values.values(), D(0))
+        return max(D(0), min(budget, cash - pending,
+                             exposure_limit - invested - pending - D(1)))
 
     async def prepare(self):
         paper_ready = self.engine.settings.mode == 'paper' and type(self.engine.broker) is PaperBroker
@@ -104,16 +148,24 @@ class SwingTrader(MorningTrader):
 
     def status(self):
         budget, invested, remaining = self.capital()
+        manual_maximum = (self.engine.settings.live_max_total_exposure_ratio
+                          if self.engine.settings.mode == 'live' else D(1))
+        manual_capacity = self.manual_buy_budget(ratio=manual_maximum) if manual_maximum >= D('.01') else D(0)
         if self.engine.kill_switch:
             execution_state = '킬 스위치 활성 · 자동 주문 중지'
         elif not self.engine.running:
             execution_state = '자동매매 중지 · 시작 버튼을 눌러야 검색합니다'
+        elif self.engine.settings.mode == 'live' and not self.active():
+            execution_state = 'LIVE 주문 잠금 · 계좌 동기화·무장 및 미확인 주문을 확인하세요'
         elif not self.market_open():
             execution_state = '장외 대기 · 평일 정규장 및 16:00~20:00 애프터마켓에 검색합니다'
         else:
             execution_state = '매도 감시 중 · 자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00'
         return {'strategy': self.strategy, 'budget': str(budget), 'spent': str(invested),
                 'remaining': str(remaining), 'message': self.message,
+                'per_symbol_budget': str(self.buy_budget()),
+                'manual_buy_capacity': str(manual_capacity),
+                'allocation_slots': 5 if self.engine.settings.mode == 'live' else None,
                 'execution_state': execution_state, 'market_open': self.market_open(),
                 'trading_hours': f'자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00 · {self.engine.settings.mode.upper()} 수동매수·매도 평일 09:00~15:30, 16:00~20:00',
                 'signal_observation_count': getattr(self, 'observation_count', 0),
@@ -160,11 +212,11 @@ class SwingTrader(MorningTrader):
         after_market_buy_window = time(16) <= current < time(20)
         return now.weekday() < 5 and (regular_buy_window or after_market_buy_window)
 
-    async def buy_qualified(self, symbol):
+    async def buy_qualified(self, symbol, ratio=None):
         """Recheck a selected candidate under the current broker's risk limits."""
         async with self._lock:
             if self.engine.settings.mode == 'live':
-                return await self._buy_live_qualified(symbol)
+                return await self._buy_live_qualified(symbol, ratio)
             if self.engine.settings.mode != 'paper' or type(self.engine.broker) is not PaperBroker:
                 raise RuntimeError('PAPER 주문만 지원합니다.')
             if self.engine.kill_switch:
@@ -187,8 +239,7 @@ class SwingTrader(MorningTrader):
             signal = await self.signal(symbol, quote)
             if not signal.get('eligible'):
                 raise RuntimeError('현재 자동매수 조건을 충족하지 않습니다.')
-            budget = max(D(0), D(self.engine.broker.account(self.engine.quotes)['total_equity']['KRW'])
-                         * self.engine.settings.recommended_trade_ratio)
+            budget = self.manual_buy_budget(symbol, ratio)
             # A manual click is an explicit repeat entry. Keep the allocation,
             # cash, and per-order limits while allowing an existing symbol to add shares.
             allowance = min(D(self.engine.broker.cash[Currency.KRW]), budget)
@@ -241,7 +292,9 @@ class SwingTrader(MorningTrader):
         self.engine.set_quote(quote)
         return quote
 
-    async def _buy_live_qualified(self, symbol):
+    async def _buy_live_qualified(self, symbol, ratio=None):
+        # Reject invalid ratios before any remote account or analysis reads.
+        self.manual_buy_budget(symbol, ratio)
         await self._reconcile_live_manual()
         broker = self.engine.broker
         if (self.engine.settings.live_symbol_policy == 'allowlist'
@@ -263,16 +316,16 @@ class SwingTrader(MorningTrader):
         await self._reconcile_live_manual()
         quote = await self.quote(symbol)
         if not membership(stock, quote.price, minimum, themes) or not swing_signal(
-                daily, quote.price, self.clock(), four_hour, weekly).get('eligible'):
+                daily, quote.ask_price, self.clock(), four_hour, weekly).get('eligible'):
             raise RuntimeError('주문 직전 매수 조건을 충족하지 않습니다.')
-        _, _, allowance = self.capital()
+        allowance = self.manual_buy_budget(symbol, ratio)
         price = quote.ask_price
         unit_cost = price * (1 + self.engine.settings.fee_rate)
         quantity = int(allowance // unit_cost)
         if self.engine.settings.live_max_order_amount_krw > 0:
             quantity = min(quantity, int(self.engine.settings.live_max_order_amount_krw // price))
         if quantity < 1:
-            raise RuntimeError('설정한 자산 비율·보유 평가액·미체결 매수·가용 현금을 적용하면 매수 예산이 부족합니다.')
+            raise RuntimeError('직접 매수 비율·총자산 한도·보유 종목·미체결 매수·가용 현금을 적용하면 매수 예산이 부족합니다.')
         await self.select_day()
         if self.session['targets'].get(symbol, {}).get('manual_exit'):
             raise RuntimeError('오늘 수동 청산한 종목은 재매수하지 않습니다.')
@@ -297,34 +350,71 @@ class SwingTrader(MorningTrader):
     async def signal(self, symbol, quote):
         daily = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1d', 100), timeout=10)
         weekly = await asyncio.wait_for(self.engine.candles(symbol, '1w', 60), timeout=20)
-        context = trend_context(daily, quote.price, self.clock(), weekly)
+        entry_price = quote.ask_price if self.engine.settings.mode == 'live' else quote.price
+        context = trend_context(daily, entry_price, self.clock(), weekly)
         four_hour = []
         if context.get('context_eligible'):
             four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
-        return swing_signal(daily, quote.price, self.clock(), four_hour, weekly)
+        return swing_signal(daily, entry_price, self.clock(), four_hour, weekly)
 
     async def exit_signal(self, symbol, quote, position, day):
-        four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
-        signal = four_hour_exit_signal(four_hour, quote.price, self.clock())
+        settings = self.engine.settings
+        sell_price = quote.bid_price if settings.mode == 'live' else quote.price
+        price_valid = sell_price is not None and sell_price.is_finite() and sell_price > 0
         target = day.setdefault('targets', {}).setdefault(symbol, {'symbol': symbol, 'name': symbol})
-        peak = D(target.get('exit_peak', '0'))
+        stop_percent = settings.live_max_position_loss_percent if settings.mode == 'live' else D('3')
+        stop_loss = bool(price_valid and position.average_price.is_finite() and position.average_price > 0
+                         and sell_price <= position.average_price * (D(1) - stop_percent / D(100)))
+        try:
+            four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
+            signal = four_hour_exit_signal(four_hour, sell_price, self.clock()) if price_valid else {}
+        except Exception:
+            # Fresh executable quotes can still protect an existing holding
+            # when the candle service is unavailable.
+            if not stop_loss and target.get('profit_trailing_armed') is not True:
+                raise
+            signal = {'ready': False, 'upper_touched': False, 'sell_at_upper': False}
+        try:
+            peak = D(target.get('exit_peak', '0'))
+            if not peak.is_finite() or peak < 0:
+                peak = D(0)
+        except (ArithmeticError, ValueError, TypeError):
+            peak = D(0)
         if signal.get('upper_touched'):
             target['upper_band_touched'] = True
             peak = max(peak, D(signal.get('active_high', quote.price)), quote.price)
             target['exit_peak'] = str(peak)
-        elif target.get('upper_band_touched'):
+        elif target.get('upper_band_touched') and price_valid:
             peak = max(peak, quote.price)
             target['exit_peak'] = str(peak)
-        stop_percent = (self.engine.settings.live_max_position_loss_percent
-                        if self.engine.settings.mode == 'live' else D('3'))
-        stop_loss = quote.price <= position.average_price * (D('1') - stop_percent / D('100'))
-        trailing_exit = bool(target.get('upper_band_touched') and peak > 0
-                             and quote.price <= peak * D('.98'))
+        profit = estimate_exit_profit(position, sell_price, settings)
+        # The current bid/last spread is also reserved at the projected trigger.
+        spread = max(D(0), quote.price - sell_price) if price_valid else D(0)
+        trigger = max(D(0), peak * D('.98') - spread)
+        trigger_profit = estimate_exit_profit(position, trigger, settings)
+        if (signal.get('ready') and target.get('upper_band_touched') and peak > 0
+                and trigger_profit['meets_minimum'] and target.get('profit_trailing_armed') is not True):
+            target.update({'profit_trailing_armed': True, 'profit_trailing_armed_at': self.clock().isoformat(),
+                           'profit_trailing_min_percent': str(settings.swing_min_net_profit_percent)})
+        armed = target.get('profit_trailing_armed') is True
+        trailing_exit = bool(price_valid and armed and peak > 0 and sell_price <= trigger)
+        take_profit = bool(signal.get('sell_at_upper') and profit['meets_minimum'])
         signal.update({'stop_loss': stop_loss, 'trailing_exit': trailing_exit,
-                       'sell': stop_loss or signal.get('sell_at_upper', False) or trailing_exit,
-                       'exit_reason': ('평균 매입가 대비 -3% 손절' if stop_loss else
-                                       '4시간봉 볼린저 상단 매도' if signal.get('sell_at_upper') else
-                                       '4시간봉 상단 터치 후 최고가 대비 -2% 매도' if trailing_exit else None)})
+                       'take_profit': take_profit, 'profit_trailing_armed': armed,
+                       'min_net_profit_percent': str(settings.swing_min_net_profit_percent),
+                       'estimated_net_return_percent': str(profit['net_return_percent']) if profit['ready'] else None,
+                       'minimum_sell_reference_price': str(profit['minimum_reference_price']) if profit['ready'] else None,
+                       'trailing_trigger_price': str(trigger),
+                       'estimated_trigger_net_return_percent': str(trigger_profit['net_return_percent']) if trigger_profit['ready'] else None,
+                       'sell': stop_loss or take_profit or trailing_exit,
+                       'exit_reason': (f'평균 매입가 대비 -{stop_percent:g}% 손절' if stop_loss else
+                                       f'4시간봉 볼린저 상단 · 예상 순수익 {settings.swing_min_net_profit_percent:g}% 이상 익절' if take_profit else
+                                       '수익 기준 활성화 후 최고가 대비 -2% 보호 매도' if trailing_exit else None)})
+        target['last_exit_check'] = {'checked_at': self.clock().isoformat(), 'quote_timestamp': quote.timestamp.isoformat(),
+                                    'sell_reference_price': str(sell_price) if price_valid else None,
+                                    **{key: signal.get(key) for key in ('bollinger_upper', 'stop_loss', 'take_profit',
+                                       'profit_trailing_armed', 'estimated_net_return_percent', 'min_net_profit_percent',
+                                       'trailing_trigger_price', 'estimated_trigger_net_return_percent', 'exit_reason')}}
         await self.save()
         return signal
 
@@ -462,9 +552,12 @@ class SwingTrader(MorningTrader):
                 except Exception as exc:
                     self.message = f'LIVE 계좌 동기화 실패 · 주문 보류: {type(exc).__name__}'
                     return
+            # Manual account purchases can arrive after startup. Adopt only
+            # quantities not already covered by filled orders or prior adoption.
+            await self.adopt_positions()
             await self.select_day()
             sell_filled = False
-            # Exit every inherited automated holding, even if the theme list or scan fails.
+            # Manage automatic and manual holdings even if the theme list or scan fails.
             for day in list(self.days.values()):
                 orders = self.daily_orders(day)
                 for symbol in sorted({o.symbol for o in orders if o.side is Side.BUY} | set(day.get('adopted', {}))):
@@ -477,6 +570,10 @@ class SwingTrader(MorningTrader):
                             raise RuntimeError(f'{symbol}: 주문 기록과 보유 수량 불일치')
                         quote = await self.quote(symbol)
                         signal = await self.exit_signal(symbol, quote, position, day)
+                        if signal['sell'] and self.engine.settings.mode == 'live':
+                            # Recheck the executable bid after the potentially slow analysis read.
+                            quote = await self.quote(symbol)
+                            signal = await self.exit_signal(symbol, quote, position, day)
                         if signal['sell'] and self.active() and self.market_open():
                             await self.record_order_attempt(Side.SELL, day=day)
                             order = await self.engine.broker.place_market_order(
@@ -485,6 +582,7 @@ class SwingTrader(MorningTrader):
                             if order.status is OrderStatus.FILLED:
                                 sell_filled = True
                                 day['outcome'] = signal['exit_reason']
+                                day['targets'][symbol]['exit_order_reason'] = signal['exit_reason']
                                 self.message = f"{symbol} {signal['exit_reason']} 완료"
                                 await self.save()
                     except Exception as exc:
@@ -499,6 +597,7 @@ class SwingTrader(MorningTrader):
                         if c.get('eligible') and c.get('currency', 'KRW') == 'KRW')
                 await self.record_scan(payload=payload)
                 filled_before = self.session.get('diagnostics', {}).get('buy_orders_filled', 0)
+                rejected_this_scan = False
                 minimum, themes = load_universe()
                 for candidate in payload['candidates']:
                     symbol = candidate['symbol']
@@ -508,14 +607,20 @@ class SwingTrader(MorningTrader):
                     if (not candidate.get('eligible') or symbol in self.engine.broker.positions
                             or symbol in self.session['targets'] or len(self.engine.broker.positions) >= 5):
                         continue
-                    quote = await self.quote(symbol)
                     stock = await asyncio.wait_for(self.engine.toss_client.stock_info(symbol), timeout=10)
+                    if self.engine.settings.mode == 'live':
+                        # Complete slow analysis before obtaining the final order book.
+                        daily = await asyncio.wait_for(self.engine.toss_client.candles(symbol, '1d', 100), timeout=10)
+                        weekly = await asyncio.wait_for(self.engine.candles(symbol, '1w', 60), timeout=20)
+                        four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
+                    quote = await self.quote(symbol)
                     if not membership(stock, quote.price, minimum, themes):
                         continue
-                    signal = await self.signal(symbol, quote)
+                    signal = (swing_signal(daily, quote.ask_price, self.clock(), four_hour, weekly)
+                              if self.engine.settings.mode == 'live' else await self.signal(symbol, quote))
                     if not signal['eligible']:
                         continue
-                    _, _, allowance = self.capital()
+                    allowance = self.buy_budget(symbol)
                     settings = self.engine.settings
                     fill = (quote.ask_price if settings.mode == 'live' else
                             quote.price * (1 + settings.slippage_bps / D(10000)))
@@ -540,9 +645,14 @@ class SwingTrader(MorningTrader):
                         data['buy_orders_filled'] = data.get('buy_orders_filled', 0) + 1
                         self.session['outcome'] = '스윙 보유 · 상단 매도 대기'
                         self.message = f'{symbol} {quantity}주 스윙 매수'
+                    elif order.status is OrderStatus.REJECTED:
+                        rejected_this_scan = True
+                        self.session['outcome'] = f'{symbol} 주문 거절: {order.reason}'
+                        self.session.setdefault('diagnostics', {})['last_error'] = order.reason
+                        self.message = self.session['outcome']
                     await self.save()
                 filled_after = self.session.get('diagnostics', {}).get('buy_orders_filled', 0)
-                if filled_after == filled_before and not sell_filled:
+                if filled_after == filled_before and not sell_filled and not rejected_this_scan:
                     self.session['outcome'] = '매수 조건 대기'
                     self.message = ('검색 완료 · 현재 매수 조건을 충족한 후보 없음' if not payload['candidates']
                                     else '검색 완료 · 후보의 보유 여부·예산·주문 전 조건에 따라 신규 매수 없음')

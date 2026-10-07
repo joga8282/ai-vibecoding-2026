@@ -110,6 +110,7 @@ class TradingEngine:
             if self.kill_switch:
                 raise RuntimeError("킬 스위치가 활성화되어 있습니다.")
             self.running = True
+            self.last_error = None
             self._task = asyncio.create_task(self._run(), name="paper-trading-engine")
 
     async def stop(self) -> None:
@@ -308,7 +309,19 @@ class TradingEngine:
 
     async def tick(self) -> None:
         if self.automation:
+            if (self.settings.mode == 'live'
+                    and not (getattr(getattr(self.broker, 'risk', None), 'armed', False)
+                             and getattr(self.broker, 'reconciled', False))):
+                self.running = False
+                self.last_error = (getattr(self.broker, 'last_order_error', None)
+                                   or 'LIVE orders are locked; reconcile and review unresolved orders before arming.')
+                return
             await self.automation.tick()
+            if (self.settings.mode == 'live'
+                    and not (self.broker.risk.armed and self.broker.reconciled)):
+                self.running = False
+                self.last_error = (getattr(self.broker, 'last_order_error', None)
+                                   or 'LIVE orders are locked; review unresolved orders before arming.')
             self.last_tick_at = datetime.now(timezone.utc)
             return
         enabled = [strategy for strategy in self.strategies.values() if strategy.enabled]
@@ -406,6 +419,10 @@ class TradingEngine:
             live_readiness = {
                 "reconciled": bool(getattr(broker, "reconciled", False)),
                 "armed": bool(getattr(getattr(broker, "risk", None), "armed", False)),
+                "unresolved_order_count": sum(
+                    item.get('status') in {'SUBMITTING', 'UNKNOWN', 'ACCEPTED', 'CANCEL_REQUESTED'}
+                    for item in getattr(broker, 'order_journal', {}).values()),
+                "last_order_error": getattr(broker, 'last_order_error', None),
                 "last_sync_at": (broker.last_sync_at.isoformat()
                                  if getattr(broker, "last_sync_at", None) else None),
             }

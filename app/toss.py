@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import time
 import urllib.error
@@ -22,6 +23,31 @@ class TossAPIError(RuntimeError):
         self.status = status
         self.path = path
         super().__init__(f"Toss API returned HTTP {status} for {path}.")
+
+
+class TossOrderAPIError(urllib.error.HTTPError):
+    """Keep the provider error code without exposing headers or response data."""
+    rejection_codes = frozenset({
+        'invalid-request', 'confirm-high-value-required', 'unsupported-content-type',
+        'insufficient-buying-power', 'order-hours-closed', 'stock-restricted',
+        'price-out-of-range', 'opposite-pending-order-exists', 'order-type-not-allowed',
+        'prerequisite-required', 'market-not-supported-for-stock',
+        'investor-exchange-not-integrated', 'amount-order-outside-regular-hours',
+        'insufficient-sellable-quantity', 'order-limit-exceeded', 'account-restricted',
+    })
+
+    def __init__(self, error, error_code):
+        path = urllib.parse.urlsplit(error.url).path
+        super().__init__(error.url, error.code, error.reason, {}, io.BytesIO())
+        self.error_code = error_code
+        self.path = path
+        self.definitive_rejection = (error.code in {400, 415, 422}
+                                     and error_code in self.rejection_codes)
+        error.close()
+        self.close()
+
+    def __str__(self):
+        return f'Toss API HTTP {self.code}: {self.error_code} ({self.path})'
 
 
 class TossMarketClient:
@@ -234,8 +260,21 @@ class TossMarketClient:
 
     @staticmethod
     def _request_json_sync(request: urllib.request.Request) -> dict:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read(65536))
+                error_code = payload.get('error', {}).get('code')
+            except (ValueError, AttributeError, TypeError, OSError):
+                exc.close()
+                raise exc
+            if (isinstance(error_code, str) and 0 < len(error_code) <= 80
+                    and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in error_code)):
+                raise TossOrderAPIError(exc, error_code) from None
+            exc.close()
+            raise exc
 
     async def _account_get(self, path: str, account_seq: str | None = None,
                            parameters: dict | None = None):

@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from app.models import Currency, Order, OrderStatus, Position, Side, serialize
 from app.risk import LiveRiskManager
+from app.toss import TossOrderAPIError
 
 
 class TossRealBroker:
@@ -22,6 +23,7 @@ class TossRealBroker:
         self.cash = {Currency.KRW: Decimal(0), Currency.USD: Decimal(0)}
         self.last_sync_at: datetime | None = None
         self.last_error: str | None = None
+        self.last_order_error: str | None = None
         self.reconciled = False
         self.holdings_summary: dict = {}
         self.settings = settings
@@ -37,6 +39,7 @@ class TossRealBroker:
         self.positions = {}
         self.orders = []
         state = await self.repository.load('live_broker_state') or {}
+        self.last_order_error = state.get('last_order_error')
         self.client_order_ids = state.get('client_order_ids', {})
         self.order_journal = state.get('order_journal', {})
         if not isinstance(self.client_order_ids, dict):
@@ -243,10 +246,27 @@ class TossRealBroker:
                 # Toss limit order prices are KRW integer won.
                 payload['price'] = str(int(limit_price))
             accepted = await self.client.create_order(self.account_seq, payload)
-        except Exception:
-            self.order_journal[exchange_id]['status'] = 'UNKNOWN'
-            await self._persist_live_state()
+        except Exception as exc:
+            item = self.order_journal[exchange_id]
+            self.last_order_error = (str(exc) if isinstance(exc, TossOrderAPIError)
+                                     else f'Order submission failed: {type(exc).__name__}')
+            if isinstance(exc, TossOrderAPIError):
+                item.update({'httpStatus': exc.code, 'errorCode': exc.error_code})
+            if isinstance(exc, TossOrderAPIError) and exc.definitive_rejection:
+                item.update({'status': 'REJECTED', 'filledQuantity': '0',
+                             'resolvedAt': datetime.now(timezone.utc).isoformat()})
+                order = Order('rejected-' + exchange_id, original_id, symbol, side, Decimal(0),
+                              valuation_price, None, quote.currency, OrderStatus.REJECTED,
+                              Decimal(0), self.last_order_error, datetime.now(timezone.utc))
+                self.orders.append(order)
+                if exc.error_code in {'prerequisite-required', 'account-restricted',
+                                      'investor-exchange-not-integrated'}:
+                    self.disarm()
+                await self._persist_live_state()
+                return order
+            item['status'] = 'UNKNOWN'
             self.risk.armed = self.risk.reconciled = self.reconciled = False
+            await self._persist_live_state()
             raise
         order_id = accepted.get('orderId')
         if not order_id:
@@ -255,6 +275,7 @@ class TossRealBroker:
             self.risk.armed = self.risk.reconciled = self.reconciled = False
             raise RuntimeError('Broker response lacked an order ID; LIVE has been disarmed.')
         self.order_journal[exchange_id].update({'status': 'ACCEPTED', 'orderId': str(order_id)})
+        self.last_order_error = None
         await self._persist_live_state()
         if request.get('returnAfterAccept') is True:
             # A still-open accepted order blocks further LIVE orders until an
@@ -469,6 +490,45 @@ class TossRealBroker:
         self.disarm()
         return order
 
+    def unresolved_orders(self):
+        return [{'client_order_id': key, 'symbol': item.get('symbol'),
+                 'side': item.get('side'), 'quantity': item.get('quantity'),
+                 'created_at': item.get('createdAt'), 'status': item.get('status'),
+                 'has_broker_id': bool(item.get('orderId')), 'error_code': item.get('errorCode')}
+                for key, item in self.order_journal.items()
+                if item.get('status') in {'SUBMITTING', 'UNKNOWN', 'ACCEPTED', 'CANCEL_REQUESTED'}]
+
+    async def confirm_unsubmitted(self, client_order_id, *, confirmed=False):
+        """Operator review closes an old unknown intent; never submits or cancels."""
+        if not confirmed:
+            raise ValueError('토스 주문내역에서 미접수 여부를 직접 확인해야 합니다.')
+        item = self.order_journal.get(client_order_id)
+        if not item or item.get('status') != 'UNKNOWN' or item.get('orderId'):
+            raise ValueError('주문번호가 없는 UNKNOWN 주문만 미접수 확인이 가능합니다.')
+        try:
+            created = datetime.fromisoformat(item['createdAt'])
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('주문 시각을 확인할 수 없어 미접수 정리를 보류했습니다.') from exc
+        if age < 60:
+            raise ValueError('최근 주문은 접수 처리가 진행 중일 수 있습니다. 1분 후 다시 확인하세요.')
+        keys = {client_order_id}
+        if item.get('originalClientOrderId'):
+            keys.add(item['originalClientOrderId'])
+        for status in ('OPEN', 'CLOSED'):
+            for row in await self.list_orders(status):
+                provider_key = row.get('clientOrderId')
+                if (provider_key in keys
+                        or (not provider_key and row.get('symbol') == item['symbol'])):
+                    raise RuntimeError('관련 증권사 주문이 발견되어 미접수로 정리할 수 없습니다.')
+        item.update({'status': 'NOT_SUBMITTED', 'operatorConfirmedNoBrokerOrder': True,
+                     'resolvedAt': datetime.now(timezone.utc).isoformat()})
+        self.disarm()
+        if not self.unresolved_orders():
+            self.last_order_error = None
+        await self._persist_live_state()
+        return {'resolved': True, 'status': 'NOT_SUBMITTED', 'armed': False}
+
     async def place_market_order(self, **kwargs):
         if not self.risk or not self.settings or not self.settings.live_trading_enabled or not self.risk.armed:
             raise RuntimeError('LIVE trading is not armed.')
@@ -519,6 +579,7 @@ class TossRealBroker:
 
     async def _persist_live_state(self) -> None:
         await self.repository.save('live_broker_state', {
+            'last_order_error': self.last_order_error,
             'client_order_ids': self.client_order_ids,
             'order_journal': self.order_journal,
             'orders': serialize(self.orders[-1000:]),
@@ -538,7 +599,7 @@ class TossRealBroker:
             order_id = item.get('orderId')
             if not order_id:
                 if all_orders is None:
-                    all_orders = await self.list_orders()
+                    all_orders = list(open_orders) + await self.list_orders('CLOSED')
                 match = next((row for row in all_orders if isinstance(row, dict)
                               and row.get('clientOrderId') == client_key), None)
                 if not match:

@@ -50,6 +50,8 @@ async function run() {
   assert.equal(element('#capitalMode').textContent, 'LIVE');
   assert.equal(element('#screeningEyebrow').textContent, 'LIVE SCREENING');
   assert.equal(element('#capitalRatioInput').max, '15');
+  assert.match(element('#strategyExitValue').textContent, /예상 순수익 3% 이상 익절/);
+  assert.match(element('#strategyExitHelp').textContent, /3% 미만에서도 가능/);
   assert.equal(element('#startButton').textContent, 'LIVE 자동매매 실행 중');
   assert.match(element('#recommendationList').innerHTML, /LIVE 실계좌 조건 확인·매수/);
   assert.match(element('#recommendationList').innerHTML, /disabled.*LIVE 허용목록에 없음/);
@@ -58,23 +60,117 @@ async function run() {
   assert.equal(context.requests[0].url, '/api/v1/live/qualified-buy/005930');
   assert.equal(context.requests[1].url, '/api/v1/live/positions/005930/close');
   for (const r of context.requests) assert.equal(JSON.parse(r.opts.body).confirm_real_order, true);
+  assert.equal(JSON.parse(context.requests[0].opts.body).ratio_percent, 15);
   vm.runInContext("state.status.automation.remaining = '0'; renderRecommendations(state.recommendations, false)", context);
   assert.match(element('#recommendationList').innerHTML, /disabled.*추가 매수 한도 없음/);
   vm.runInContext(`
-    state.risk.recommended_trade_ratio = '1';
+    state.risk.recommended_trade_ratio = '.15';
+    state.risk.manual_trade_ratio = '.5';
     state.risk.live_limits = {symbol_policy: 'recommended', allowed_symbols: [],
-      max_total_exposure_ratio: '1', max_order_amount_krw: '0'};
-    state.status.automation.remaining = '1000000';
+      max_total_exposure_ratio: '1', auto_max_total_exposure_ratio: '.15', max_order_amount_krw: '0'};
+    state.status.automation.remaining = '180000';
+    state.status.automation.manual_buy_capacity = '999999';
+    state.account = {cash: {KRW: '1000000'}, total_equity: {KRW: '1200000'}};
     renderStatus(state.status, state.risk);
-    renderCapital({cash: {KRW: '1000000'}, total_equity: {KRW: '1200000'}},
-      state.risk, state.status, {by_currency: {}});
+    renderCapital(state.account, state.risk, state.status, {by_currency: {}});
   `, context);
-  assert.equal(element('#capitalRatioInput').max, '100');
-  assert.equal(element('#capitalRatioInput').value, '100');
+  assert.equal(element('#capitalRatioInput').max, '15');
+  assert.equal(element('#capitalRatioInput').value, '15');
+  assert.equal(element('#manualRatioInput').max, '100');
+  assert.equal(element('#manualRatioInput').value, '50');
   assert.match(element('#capitalRecommendationHelp').textContent, /100% 이내/);
   assert.match(element('#capitalRecommendationHelp').textContent, /가용 현금 한도/);
   assert.doesNotMatch(element('#recommendationList').innerHTML, /LIVE 허용목록에 없음/);
   assert.match(element('#investmentRatioHelp').textContent, /최신 추천/);
+  assert.match(element('#investmentRatioHelp').textContent, /1\/5/);
+  vm.runInContext(`renderRecommendations({budget: '1000000', candidates: [
+    {symbol: '012450', name: 'expensive', currency: 'KRW', price: '2000000', quantity: 0}],
+    watchlist: []}, false)`, context);
+  assert.match(element('#recommendationList').innerHTML, /disabled.*직접 매수 예산으로 1주 매수 불가/);
+  await vm.runInContext(`(async () => {
+    renderRecommendations({budget: '180000', candidates: [{symbol: '012450', name: 'manual',
+      currency: 'KRW', price: '100000', quantity: 0}], watchlist: []}, false);
+    $('#manualRatioInput').value = '25';
+    await $('#manualRatioInput').events.input({currentTarget: $('#manualRatioInput')});
+    await $('#manualRatioInput').events.change({currentTarget: $('#manualRatioInput')});
+  })()`, context);
+  assert.equal(context.requests.at(-1).url, '/api/v1/settings/manual-investment-ratio');
+  assert.equal(JSON.parse(context.requests.at(-1).opts.body).ratio_percent, 25);
+  assert.equal(element('#capitalRatioInput').value, '15');
+  assert.match(element('#manualRatioPreview').textContent, /300,000/);
+  assert.match(element('#recommendationList').innerHTML, /자동 배분 최대 0주 · 직접 25% 선택 시 예상 3주/);
+  assert.doesNotMatch(element('#recommendationList').innerHTML, /disabled/);
+  vm.runInContext(`
+    state.status.live_readiness = {armed: false, reconciled: true, unresolved_order_count: 1};
+    renderStatus(state.status, state.risk);
+    renderOrderReview([{client_order_id: 'mock-key', symbol: '012450', side: 'BUY', quantity: '4',
+      status: 'UNKNOWN', has_broker_id: false}]);
+  `, context);
+  assert.equal(element('#engineLabel').textContent, 'LIVE 주문 잠금');
+  assert.match(element('#engineDetail').textContent, /미확인 주문 1건/);
+  assert.notEqual(element('#startButton').textContent, 'LIVE 자동매매 실행 중');
+  assert.equal(element('#liveOrderReview').hidden, false);
+  assert.match(element('#liveOrderReviewList').innerHTML, /미접수 정리/);
+  vm.runInContext(`
+    renderRecommendations({budget: '1000000', candidates: [{symbol: '005930', name: 'low',
+      strategy: 'swing-v2-mtf-4h', currency: 'KRW', price: '100', quantity: 1,
+      entry_ceiling: '101', bollinger_lower: '99'}], watchlist: [{symbol: '000660',
+      currency: 'KRW', entry_ceiling: '90', four_hour_band_position_percent: '70',
+      daily_range_position_percent: '80', rejection_reasons: ['high zone']}]}, false);
+  `, context);
+  assert.match(element('#recommendationList').innerHTML, /밴드 하위 25%/);
+  assert.match(element('#recommendationList').innerHTML, /최근 20일 고저 범위 하위 40%/);
+  assert.match(element('#recommendationList').innerHTML, /매수 상한 101/);
+  assert.match(element('#recommendationWatchlist').innerHTML, /4시간 밴드 내 위치 70%/);
+  assert.match(element('#recommendationWatchlist').innerHTML, /high zone/);
+  assert.match(element('#recommendationWatchlist').innerHTML, /매수 추천 아님/);
+  assert.match(element('#recommendationList').innerHTML, /매수 자리 도달/);
+  assert.match(element('#recommendationList').innerHTML, /최근 20주 하위 40%/);
+  assert.equal(vm.runInContext("fourHourCandleCompleted('2026-10-07T09:00:00+09:00', new Date('2026-10-07T12:59:59+09:00'))", context), false);
+  assert.equal(vm.runInContext("fourHourCandleCompleted('2026-10-07T09:00:00+09:00', new Date('2026-10-07T13:00:00+09:00'))", context), true);
+  assert.equal(vm.runInContext("fourHourCandleCompleted('2026-10-07T13:00:00+09:00', new Date('2026-10-07T15:29:59+09:00'))", context), false);
+  assert.equal(vm.runInContext("fourHourCandleCompleted('2026-10-07T13:00:00+09:00', new Date('2026-10-07T15:30:00+09:00'))", context), true);
+  vm.runInContext(`
+    const chartNow = new Date(), offset = 9 * 60 * 60 * 1000;
+    const localNow = new Date(chartNow.getTime() + offset);
+    const futureStart = new Date(Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate() + 1, 9) - offset);
+    const chartBars = [100, 101, 102, 103, 104, 105].map((value, index) => ({
+      timestamp: new Date(futureStart.getTime() - (8 - index) * 86400000).toISOString(),
+      open_price: value, high_price: value, low_price: value, close_price: value, volume: 10}));
+    chartBars.push({timestamp: futureStart.toISOString(), open_price: 1000, high_price: 1000,
+      low_price: 1000, close_price: 1000, volume: 10});
+    const dailyBars = Array.from({length: 30}, (_, index) => ({
+      timestamp: new Date(futureStart.getTime() - (30 - index) * 86400000).toISOString(),
+      open_price: 500, high_price: 500, low_price: 500, close_price: 500, volume: 10}));
+    renderCandlestickChart(chartBars, '4h', dailyBars);
+    globalThis.expectedBandText = '볼린저 상단 ' + number(102.5 + 2 * Math.sqrt(35 / 12), 'KRW')
+      + ' · 하단 ' + number(102.5 - 2 * Math.sqrt(35 / 12), 'KRW');
+  `, context);
+  const chart = element('#candidateChartCanvas').innerHTML;
+  assert.match(chart, /BB6 상단/);
+  assert.match(element('#candidateChartMeta').textContent, /4시간 BB\(6,2\) · 완료봉 기준/);
+  assert.equal(chart.split(context.expectedBandText).length - 1, 2);
+  assert.equal(vm.runInContext("kstWeekStart('2026-10-04T23:59:59+09:00') < kstWeekStart('2026-10-05T00:00:00+09:00')", context), true);
+  vm.runInContext(`
+    const weekStart = kstWeekStart(new Date());
+    const weeklyChart = Array.from({length: 22}, (_, index) => ({
+      timestamp: new Date(weekStart - (22-index) * 7 * 86400000).toISOString(),
+      open_price: 100+index, high_price: 102+index, low_price: 98+index,
+      close_price: 100+index, volume: 10}));
+    for (const weekOffset of [0, 1]) weeklyChart.push({
+      timestamp: new Date(weekStart + weekOffset * 7 * 86400000).toISOString(),
+      open_price: 1000, high_price: 2000, low_price: 1, close_price: 1000, volume: 10});
+    renderCandlestickChart(weeklyChart, '1w', dailyBars);
+    globalThis.expectedWeeklyBand = '볼린저 상단 ' + number(111.5 + 2 * Math.sqrt(399 / 12), 'KRW')
+      + ' · 하단 ' + number(111.5 - 2 * Math.sqrt(399 / 12), 'KRW');
+  `, context);
+  const weeklyChart = element('#candidateChartCanvas').innerHTML;
+  assert.match(weeklyChart, /주 BB20 상단/);
+  assert.match(weeklyChart, /weekly-entry-zone/);
+  assert.ok(Number(weeklyChart.match(/class="weekly-entry-zone"[\s\S]*?<rect x="([^"]+)"/)[1]) > 18);
+  assert.match(weeklyChart, /주봉 매수 관심 97 ~ 109/);
+  assert.match(element('#candidateChartMeta').textContent, /주봉 BB\(20,2\)/);
+  assert.equal(weeklyChart.split(context.expectedWeeklyBand).length - 1, 3);
   console.log('LIVE dashboard rendering, route selection, confirmations and blocked buys: OK');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

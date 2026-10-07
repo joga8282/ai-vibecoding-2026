@@ -105,6 +105,61 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.assertIs(self.broker.risk.settings, self.engine.settings)
         self.assertEqual((await self.repository.load('trading_preferences'))['recommended_trade_ratio'], '0.1')
 
+    async def test_direct_ratio_setting_is_authenticated_and_independent(self):
+        await self.repository.save('trading_preferences', {'recommended_trade_ratio': '0.15', 'other': 'keep'})
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            path, headers = '/api/v1/settings/manual-investment-ratio', {'X-API-Token': 'mock-token'}
+            self.assertEqual((await client.put(path, json={'ratio_percent': 5})).status_code, 401)
+            self.assertEqual((await client.put(path, json={'ratio_percent': 16}, headers=headers)).status_code, 422)
+            self.assertEqual((await client.put(path, json={'ratio_percent': 5}, headers=headers)).status_code, 200)
+            self.assertEqual((await client.put('/api/v1/settings/investment-ratio',
+                json={'ratio_percent': 10}, headers=headers)).status_code, 200)
+        self.assertEqual(self.engine.settings.manual_trade_ratio, D('.05'))
+        self.assertEqual(self.engine.settings.recommended_trade_ratio, D('.10'))
+        self.assertEqual(await self.repository.load('trading_preferences'), {
+            'recommended_trade_ratio': '0.1', 'manual_trade_ratio': '0.05', 'other': 'keep'})
+
+    async def test_selected_order_ratio_reaches_trader_without_saving_automatic_ratio(self):
+        self.auto.buy_qualified = AsyncMock(return_value=self.order())
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            response = await client.post('/api/v1/live/qualified-buy/005930',
+                json={'confirm_real_order': True, 'ratio_percent': 5}, headers={'X-API-Token': 'mock-token'})
+            self.assertEqual(response.status_code, 200)
+        self.auto.buy_qualified.assert_awaited_once_with('005930', ratio=D('.05'))
+        self.assertEqual(self.engine.settings.recommended_trade_ratio, D('.15'))
+
+    async def test_selected_order_ratio_cannot_exceed_aggregate_limit(self):
+        self.auto.buy_qualified = AsyncMock()
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            response = await client.post('/api/v1/live/qualified-buy/005930',
+                json={'confirm_real_order': True, 'ratio_percent': 16}, headers={'X-API-Token': 'mock-token'})
+            self.assertEqual(response.status_code, 422)
+        self.auto.buy_qualified.assert_not_awaited()
+
+    async def test_concurrent_ratio_updates_preserve_both_preferences(self):
+        import asyncio
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            headers = {'X-API-Token': 'mock-token'}
+            responses = await asyncio.gather(
+                client.put('/api/v1/settings/investment-ratio', json={'ratio_percent': 10}, headers=headers),
+                client.put('/api/v1/settings/manual-investment-ratio', json={'ratio_percent': 5}, headers=headers))
+            self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(await self.repository.load('trading_preferences'), {
+            'recommended_trade_ratio': '0.1', 'manual_trade_ratio': '0.05'})
+        self.assertEqual(self.engine.settings.recommended_trade_ratio, D('.10'))
+        self.assertEqual(self.engine.settings.manual_trade_ratio, D('.05'))
+
+    async def test_automatic_ratio_cannot_inherit_full_manual_exposure_limit(self):
+        settings = replace(self.settings, live_max_total_exposure_ratio=D(1))
+        self.app.state.settings = self.engine.settings = self.broker.settings = self.broker.risk.settings = settings
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            headers = {'X-API-Token': 'mock-token'}
+            self.assertEqual((await client.put('/api/v1/settings/investment-ratio',
+                json={'ratio_percent': 100}, headers=headers)).status_code, 422)
+            self.assertEqual((await client.put('/api/v1/settings/manual-investment-ratio',
+                json={'ratio_percent': 100}, headers=headers)).status_code, 200)
+        self.assertEqual(self.engine.settings.recommended_trade_ratio, D('.15'))
+
     async def test_capital_uses_market_value_pending_buys_and_strict_boundary(self):
         self.broker.positions['005930'] = Position('005930', D(1), D(100), Currency.KRW)
         self.broker.position_market_values['005930'] = D(150000)
@@ -119,6 +174,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.assertEqual(self.auto.capital()[2], D(0))
 
     async def test_selected_live_buy_rechecks_recommendation_and_final_quote(self):
+        self.broker.cash[Currency.KRW] = D(3000000)
         result = self.order()
         self.broker.place_market_order = AsyncMock(return_value=result)
         with patch('app.swing_trader.membership', return_value=True), patch(
@@ -126,7 +182,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
             self.assertIs(await self.auto.buy_qualified('005930'), result)
         args = self.broker.place_market_order.await_args.kwargs
         self.assertEqual(args['quantity'], D(1))
-        self.assertEqual(args['order_budget'], D(149999))
+        self.assertEqual(args['order_budget'], D(449999))
         self.assertIs(args['quote'], self.book)
         self.assertEqual(self.broker.reconcile.await_count, 2)
         self.recommend.assert_awaited_once()
@@ -154,6 +210,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.broker.place_market_order.assert_not_awaited()
 
     async def test_live_partial_buy_is_reported_as_partial_without_retry(self):
+        self.broker.cash[Currency.KRW] = D(3000000)
         self.broker.place_market_order = AsyncMock(return_value=self.order(status=OrderStatus.PARTIALLY_FILLED))
         with patch('app.swing_trader.membership', return_value=True), patch(
                 'app.swing_trader.swing_signal', return_value={'eligible': True}):
@@ -190,6 +247,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.client.create_order.assert_not_awaited()
 
     async def test_live_automatic_buy_sizes_at_ask_and_live_order_limit(self):
+        self.broker.cash[Currency.KRW] = D(4000000)
         self.engine.running = True
         self.engine.settings = replace(self.settings, max_order_amount_krw=D(1000000))
         self.broker.place_market_order = AsyncMock(return_value=self.order())
@@ -199,7 +257,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         args = self.broker.place_market_order.await_args.kwargs
         self.assertEqual(args['quantity'], D(1))
         self.assertIs(args['quote'], self.book)
-        self.assertEqual(args['order_budget'], D(149999))
+        self.assertEqual(args['order_budget'], D(100000))
 
     async def test_live_automatic_buy_skips_symbols_outside_allowlist(self):
         self.engine.running = True
@@ -209,8 +267,39 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.broker.place_market_order.assert_not_awaited()
         self.client.stock_info.assert_not_awaited()
 
+    async def test_live_exit_rechecks_final_bid_against_net_profit_gate(self):
+        self.broker.positions['005930'] = Position('005930', D(1), D(69900), Currency.KRW)
+        self.broker.position_market_values['005930'] = D(71500)
+        await self.auto.restore()
+        self.engine.running = True
+        first = Quote('005930', D(72500), Currency.KRW, datetime.now(timezone.utc), 'toss', D(72500), D(72550))
+        final = Quote('005930', D(71500), Currency.KRW, datetime.now(timezone.utc), 'toss', D(71500), D(71550))
+        self.auto.quote = AsyncMock(side_effect=[first, final])
+        self.broker.place_market_order = AsyncMock()
+        self.recommend.return_value = {'candidates': []}
+        baseline = {'ready': True, 'upper_touched': True, 'sell_at_upper': True,
+                    'bollinger_upper': '71000', 'active_high': '72500'}
+        with patch('app.swing_trader.four_hour_exit_signal', side_effect=lambda *args: dict(baseline)):
+            await self.auto.tick()
+        self.assertEqual(self.auto.quote.await_count, 2)
+        self.broker.place_market_order.assert_not_awaited()
+        target = next(day['targets']['005930'] for day in self.auto.days.values() if '005930' in day['targets'])
+        self.assertEqual(target['last_exit_check']['sell_reference_price'], '71500')
+        self.assertFalse(target['last_exit_check']['take_profit'])
+        self.assertFalse(target['last_exit_check']['profit_trailing_armed'])
+
+    async def test_risk_endpoint_reports_profit_policy_without_changing_allocation(self):
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url='http://mock') as client:
+            result = (await client.get('/api/v1/risk/status')).json()
+        self.assertEqual(result['swing_exit_policy']['min_net_profit_percent'], '3')
+        self.assertEqual(result['swing_exit_policy']['estimated_sell_tax_rate'], '0.002')
+        self.assertTrue(result['swing_exit_policy']['protective_exit_below_minimum'])
+        self.assertEqual(result['recommended_trade_ratio'], '0.15')
+        self.assertEqual(result['live_limits']['max_total_exposure_ratio'], '0.15')
+
     def enable_full_equity(self):
         settings = replace(self.settings, recommended_trade_ratio=D(1), live_max_total_exposure_ratio=D(1),
+                           live_auto_max_total_exposure_ratio=D(1), manual_trade_ratio=D('.20'),
                            live_max_order_amount_krw=D(0), live_max_total_exposure_krw=D(0),
                            live_symbol_policy='recommended', fee_rate=D('.00015'))
         self.engine.settings = self.broker.settings = self.broker.risk.settings = settings
@@ -222,13 +311,15 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.broker.position_market_values['005930'] = D(200000)
         self.broker.open_orders = [{'side': 'BUY', 'quantity': '1', 'price': '50000'}]
         self.assertEqual(self.auto.capital(), (D(1200000), D(200000), D(949999)))
+        self.book.symbol = '082740'
+        self.recommend.return_value = {'candidates': [{'symbol': '082740', 'eligible': True}]}
         self.broker.place_market_order = AsyncMock(return_value=self.order())
         with patch('app.swing_trader.membership', return_value=True), patch(
                 'app.swing_trader.swing_signal', return_value={'eligible': True}):
-            await self.auto.buy_qualified('005930')
+            await self.auto.buy_qualified('082740')
         args = self.broker.place_market_order.await_args.kwargs
-        self.assertEqual(args['quantity'], D(13))
-        self.assertEqual(args['order_budget'], D(949999))
+        self.assertEqual(args['quantity'], D(3))
+        self.assertEqual(args['order_budget'], D(240000))
         self.assertLessEqual(args['quantity'] * self.book.ask_price * D('1.00015'), args['order_budget'])
 
     async def test_full_equity_manual_buy_can_select_a_new_qualified_symbol(self):
@@ -239,7 +330,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         with patch('app.swing_trader.membership', return_value=True), patch(
                 'app.swing_trader.swing_signal', return_value={'eligible': True}):
             await self.auto.buy_qualified('082740')
-        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(14))
+        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(2))
         self.assertIn('082740', self.broker.risk.recommended_symbols)
 
     async def test_full_equity_automatic_buy_uses_new_recommendation_and_cash_budget(self):
@@ -251,7 +342,7 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         with patch('app.swing_trader.membership', return_value=True), patch(
                 'app.swing_trader.swing_signal', return_value={'eligible': True}):
             await self.auto.tick()
-        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(14))
+        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(2))
         self.assertIn('082740', self.broker.risk.recommended_symbols)
 
     async def test_full_equity_still_checks_broker_cash_before_transport(self):
@@ -291,4 +382,22 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
             async with app.router.lifespan_context(app):
                 self.assertEqual(app.state.settings.recommended_trade_ratio, D('.15'))
                 self.assertFalse(app.state.live_broker.risk.armed)
+
+    async def test_restart_clamps_old_full_allocation_and_restores_direct_ratio(self):
+        client = Mock(holdings=AsyncMock(return_value={'items': []}),
+                      account_orders=AsyncMock(return_value=[]),
+                      buying_power=AsyncMock(return_value={'cashBuyingPower': '1000000'}))
+        settings = replace(self.settings, recommended_trade_ratio=D(1),
+                           toss_client_id='mock', toss_client_secret='mock', toss_account_seq='mock')
+        for saved_manual, expected in (('0.05', D('.05')), ('1', D('.15'))):
+            await self.repository.save('trading_preferences', {
+                'recommended_trade_ratio': '1', 'manual_trade_ratio': saved_manual})
+            with patch('app.main.TossMarketClient', return_value=client):
+                app = create_app(settings)
+                async with app.router.lifespan_context(app):
+                    self.assertEqual(app.state.settings.recommended_trade_ratio, D('.15'))
+                    self.assertEqual(app.state.settings.manual_trade_ratio, expected)
+                    self.assertEqual(app.state.engine.automation.buy_budget('005930'), D(30000))
+                    self.assertFalse(app.state.live_broker.risk.armed)
+            client.create_order.assert_not_called()
 

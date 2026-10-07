@@ -66,6 +66,11 @@ class InvestmentRatioInput(BaseModel):
     ratio_percent: Decimal = Field(ge=1, le=100)
 
 
+class UnsubmittedOrderReviewInput(BaseModel):
+    client_order_id: str = Field(min_length=1, max_length=100)
+    confirm_no_broker_order: bool = False
+
+
 class LiveLimitOrderTestInput(BaseModel):
     symbol: str = Field(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9.\-]+$")
     side: Side
@@ -76,6 +81,14 @@ class LiveLimitOrderTestInput(BaseModel):
 
 class LiveTradeInput(BaseModel):
     confirm_real_order: Literal[True]
+
+
+class ManualBuyInput(BaseModel):
+    ratio_percent: Decimal | None = Field(default=None, ge=1, le=100)
+
+
+class LiveBuyInput(LiveTradeInput, ManualBuyInput):
+    pass
 
 
 def get_engine(request: Request) -> TradingEngine:
@@ -96,6 +109,7 @@ def require_live_access(request: Request) -> TossRealBroker:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     selected_settings = settings or Settings.from_env()
+    trade_ratio_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -107,14 +121,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if saved_ratio is not None:
             try:
                 ratio = Decimal(str(saved_ratio))
-                maximum = selected_settings.live_max_total_exposure_ratio if selected_settings.mode == 'live' else Decimal('.5')
+                maximum = min(selected_settings.live_auto_max_total_exposure_ratio,
+                              selected_settings.live_max_total_exposure_ratio) if selected_settings.mode == 'live' else Decimal('.5')
                 if ratio.is_finite() and Decimal('.01') <= ratio <= maximum:
                     selected_settings = replace(selected_settings, recommended_trade_ratio=ratio)
             except (ArithmeticError, ValueError, TypeError):
                 logging.getLogger(__name__).warning('Ignoring invalid saved investment ratio.')
         if selected_settings.mode == 'live':
             selected_settings = replace(selected_settings, recommended_trade_ratio=min(
-                selected_settings.recommended_trade_ratio, selected_settings.live_max_total_exposure_ratio))
+                selected_settings.recommended_trade_ratio, selected_settings.live_max_total_exposure_ratio,
+                selected_settings.live_auto_max_total_exposure_ratio))
+        manual_maximum = selected_settings.live_max_total_exposure_ratio if selected_settings.mode == 'live' else Decimal(1)
+        try:
+            manual_ratio = Decimal(str(trading_preferences.get('manual_trade_ratio', selected_settings.manual_trade_ratio)))
+            if not manual_ratio.is_finite() or not Decimal('.01') <= manual_ratio <= manual_maximum:
+                manual_ratio = min(selected_settings.manual_trade_ratio, manual_maximum)
+        except (ArithmeticError, ValueError, TypeError):
+            manual_ratio = min(selected_settings.manual_trade_ratio, manual_maximum)
+        selected_settings = replace(selected_settings, manual_trade_ratio=manual_ratio)
         toss_client = None
         if (
             selected_settings.toss_market_data_enabled
@@ -227,7 +251,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 'orders_enabled': bool(broker.risk and broker.settings and broker.settings.live_trading_enabled),
                 'armed': bool(broker.risk and broker.risk.armed), 'reconciled': broker.reconciled,
                 'last_sync_at': broker.last_sync_at.isoformat() if broker.last_sync_at else None,
-                'last_error': broker.last_error}
+                'last_error': broker.last_error, 'last_order_error': getattr(broker, 'last_order_error', None),
+                'unresolved_order_count': sum(
+                    item.get('status') in {'SUBMITTING', 'UNKNOWN', 'ACCEPTED', 'CANCEL_REQUESTED'}
+                    for item in getattr(broker, 'order_journal', {}).values())}
 
     @app.post('/api/v1/live/arm')
     async def live_arm(request: Request) -> dict:
@@ -267,6 +294,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get('/api/v1/live/accounts')
     async def live_accounts(request: Request) -> dict:
         return {'accounts': await require_live_access(request).get_accounts()}
+
+    @app.get('/api/v1/live/order-review')
+    async def live_order_review(request: Request) -> dict:
+        return {'orders': require_live_access(request).unresolved_orders()}
+
+    @app.post('/api/v1/live/order-review/confirm-unsubmitted')
+    async def confirm_unsubmitted_order(payload: UnsubmittedOrderReviewInput, request: Request) -> dict:
+        broker = require_live_access(request)
+        if get_engine(request).running:
+            raise HTTPException(status_code=409, detail='자동매매를 중지한 뒤 미확인 주문을 검토하세요.')
+        try:
+            return await broker.confirm_unsubmitted(
+                payload.client_order_id, confirmed=payload.confirm_no_broker_order)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail='증권사 주문내역 조회 실패 · 기록을 보존했습니다.') from exc
 
     @app.get('/api/v1/live/positions')
     async def live_positions(request: Request) -> dict:
@@ -480,6 +524,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "fee_rate": str(settings.fee_rate),
             "slippage_bps": str(settings.slippage_bps),
             "recommended_trade_ratio": str(settings.recommended_trade_ratio),
+            "manual_trade_ratio": str(settings.manual_trade_ratio),
+            "swing_exit_policy": {
+                "min_net_profit_percent": str(settings.swing_min_net_profit_percent),
+                "estimated_fee_rate": str(settings.fee_rate),
+                "estimated_sell_tax_rate": str(settings.live_sell_tax_rate if settings.mode == 'live' else Decimal(0)),
+                "slippage_bps": str(settings.slippage_bps),
+                "trailing_drawdown_percent": "2",
+                "trailing_activation": "projected_net_profit_at_trigger",
+                "protective_exit_below_minimum": True,
+            },
             "live_limits": {
                 "allowed_symbols": (sorted(getattr(getattr(engine.broker, 'risk', None), 'recommended_symbols', ()))
                                     if settings.live_symbol_policy == 'recommended' else list(settings.live_allowed_symbols)),
@@ -487,6 +541,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_order_amount_krw": str(settings.live_max_order_amount_krw),
                 "max_total_exposure_krw": str(settings.live_max_total_exposure_krw),
                 "max_total_exposure_ratio": str(settings.live_max_total_exposure_ratio),
+                "auto_max_total_exposure_ratio": str(settings.live_auto_max_total_exposure_ratio),
             } if settings.mode == 'live' else None,
         }
 
@@ -495,23 +550,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ratio = payload.ratio_percent / Decimal("100")
         if request.app.state.settings.mode == 'live':
             require_live_access(request)
-            if ratio > request.app.state.settings.live_max_total_exposure_ratio:
-                maximum = request.app.state.settings.live_max_total_exposure_ratio * 100
-                raise HTTPException(status_code=422, detail=f'LIVE 투자비율은 설정된 총자산 한도 {maximum:g}% 이하로 설정하세요.')
+            maximum = min(request.app.state.settings.live_max_total_exposure_ratio,
+                          request.app.state.settings.live_auto_max_total_exposure_ratio) * 100
+            if payload.ratio_percent > maximum:
+                raise HTTPException(status_code=422, detail=f'LIVE 자동매매 투자비율은 {maximum:g}% 이하로 설정하세요.')
         elif payload.ratio_percent > 50:
             raise HTTPException(status_code=422, detail='PAPER 투자비율은 50% 이하로 설정하세요.')
-        settings = replace(request.app.state.settings, recommended_trade_ratio=ratio)
-        await request.app.state.repository.save(
-            "trading_preferences", {"recommended_trade_ratio": str(ratio)}
-        )
-        request.app.state.settings = settings
-        engine = get_engine(request)
-        engine.settings = settings
-        if hasattr(engine.broker, "settings"):
-            engine.broker.settings = settings
-        if getattr(engine.broker, 'risk', None):
-            engine.broker.risk.settings = settings
+        await save_trade_ratio(request, 'recommended_trade_ratio', ratio)
         return {"ratio_percent": str(payload.ratio_percent), "recommended_trade_ratio": str(ratio)}
+
+    @app.put('/api/v1/settings/manual-investment-ratio')
+    async def update_manual_investment_ratio(payload: InvestmentRatioInput, request: Request) -> dict:
+        settings = request.app.state.settings
+        if settings.mode == 'live':
+            require_live_access(request)
+            if payload.ratio_percent > settings.live_max_total_exposure_ratio * 100:
+                raise HTTPException(status_code=422, detail='직접 매수 비율은 LIVE 총자산 한도 이하여야 합니다.')
+        ratio = payload.ratio_percent / Decimal(100)
+        await save_trade_ratio(request, 'manual_trade_ratio', ratio)
+        return {'ratio_percent': str(payload.ratio_percent), 'manual_trade_ratio': str(ratio)}
+
+    async def save_trade_ratio(request: Request, key: str, ratio: Decimal):
+        async with trade_ratio_lock:
+            settings = replace(request.app.state.settings, **{key: ratio})
+            preferences = await request.app.state.repository.load('trading_preferences') or {}
+            preferences[key] = str(ratio)
+            await request.app.state.repository.save('trading_preferences', preferences)
+            request.app.state.settings = settings
+            engine = get_engine(request)
+            engine.settings = settings
+            if hasattr(engine.broker, "settings"):
+                engine.broker.settings = settings
+            if getattr(engine.broker, 'risk', None):
+                engine.broker.risk.settings = settings
 
     @app.post("/api/v1/paper/reset")
     async def reset_paper_account(payload: PaperResetInput, request: Request) -> dict:
@@ -635,12 +706,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"order": serialize(order), "message": "PAPER 테스트 1주 매수 완료"}
 
     @app.post("/api/v1/paper/qualified-buy/{symbol}")
-    async def qualified_buy(symbol: str, request: Request) -> dict:
+    async def qualified_buy(symbol: str, request: Request, payload: ManualBuyInput | None = None) -> dict:
         engine = get_engine(request)
         if engine.settings.mode != 'paper':
             raise HTTPException(status_code=409, detail='PAPER 주문 API는 PAPER 모드에서만 사용할 수 있습니다.')
         try:
-            order = await engine.automation.buy_qualified(symbol.strip().upper())
+            kwargs = {'ratio': payload.ratio_percent / 100} if payload and payload.ratio_percent is not None else {}
+            order = await engine.automation.buy_qualified(symbol.strip().upper(), **kwargs)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
@@ -649,13 +721,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"order": serialize(order), "message": "자산 비율 PAPER 매수 완료"}
 
     @app.post('/api/v1/live/qualified-buy/{symbol}')
-    async def live_qualified_buy(symbol: str, payload: LiveTradeInput, request: Request) -> dict:
+    async def live_qualified_buy(symbol: str, payload: LiveBuyInput, request: Request) -> dict:
         require_live_access(request)
         engine = get_engine(request)
         if not engine.automation:
             raise HTTPException(status_code=409, detail='LIVE 자동매매 주문이 활성화되지 않았습니다.')
+        ratio_percent = getattr(payload, 'ratio_percent', None)
+        if ratio_percent is not None and ratio_percent > engine.settings.live_max_total_exposure_ratio * 100:
+            raise HTTPException(status_code=422, detail='직접 매수 비율은 LIVE 총자산 한도 이하여야 합니다.')
         try:
-            order = await engine.automation.buy_qualified(symbol.strip().upper())
+            kwargs = {'ratio': ratio_percent / 100} if ratio_percent is not None else {}
+            order = await engine.automation.buy_qualified(symbol.strip().upper(), **kwargs)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:

@@ -87,27 +87,43 @@ async def build_swing_recommendations(engine):
         if not failed:
             detail.update({key: signal.get(key) for key in (
                 'price', 'ma20', 'ma60', 'weekly_ma10', 'bollinger_lower', 'bollinger_upper',
-                'band_distance_percent', 'conditions_passed', 'conditions_total')})
+                'band_distance_percent', 'conditions_passed', 'conditions_total',
+                'entry_ceiling', 'four_hour_band_position_percent', 'daily_range_position_percent',
+                'daily_bottom_zone', 'entry_zone_eligible', 'entry_policy',
+                'weekly_bottom_zone', 'weekly_entry_checked', 'weekly_entry_ceiling',
+                'weekly_range_position_percent', 'weekly_recent_low', 'weekly_recent_high',
+                'weekly_support_floor', 'weekly_support_broken', 'entry_floor')})
         details.append(detail)
-        if signal.get('weekly_peak_excluded') or signal.get('weekly_peak_checked') is not True:
+        if (signal.get('weekly_peak_excluded') or signal.get('weekly_peak_checked') is not True
+                or signal.get('weekly_bottom_zone') is not True or signal.get('weekly_entry_checked') is not True):
             continue
         if failed:
             continue
         settings = engine.settings
         fill = quote.price * (1 + settings.slippage_bps / D(10000))
-        quantity = int(remaining // (fill * (1 + settings.fee_rate)))
+        allowance = auto.buy_budget(symbol)
+        quantity = int(allowance // (fill * (1 + settings.fee_rate)))
         if settings.mode == 'live' and settings.live_max_order_amount_krw > 0:
             quantity = min(quantity, int(settings.live_max_order_amount_krw // fill))
         item = {**signal, 'symbol': symbol, 'name': stock.get('name') or symbol,
                 'themes': themes[symbol], 'strategy': 'swing-v2-mtf-4h', 'currency': 'KRW',
                 'quantity': quantity, 'market_cap': str(quote.price * D(stock['sharesOutstanding']))}
-        (candidates if signal['eligible'] else watchlist).append(item)
+        if settings.mode == 'live':
+            item['order_budget'] = str(allowance)
+        if signal['eligible']:
+            candidates.append(item)
+        elif (signal.get('daily_bottom_zone') is True and D(signal.get('entry_ceiling', '0')) > 0
+              and quote.price <= D(signal['entry_ceiling']) * D('1.03')):
+            # Diagnostic rows retain every exclusion. Visible waiting stocks
+            # must be near the entry price, rather than merely trend-qualified.
+            watchlist.append(item)
     candidates.sort(key=lambda c: (-D(c['market_cap']), c['symbol']))
     watchlist.sort(key=lambda c: (-c.get('conditions_passed', 0), abs(D(c.get('band_distance_percent', '999'))), -D(c['market_cap'])))
     analyzed_count = sum(not isinstance(result, Exception) for result in results)
-    return {'budget': str(remaining), 'candidates': candidates[:5], 'watchlist': watchlist[:5],
+    return {'budget': str(remaining), 'per_symbol_budget': str(auto.buy_budget()),
+            'candidates': candidates[:5], 'watchlist': watchlist[:5],
             'funnel': {'universe': len(symbols), 'budget_liquidity': len(quote_map),
                        'risk_filtered': len(eligible), 'analyzed': analyzed_count, 'qualified': len(candidates)},
             'diagnostics': {'analyzed_count': analyzed_count, 'qualified_count': len(candidates),
                             'rejection_counts': dict(counts), 'symbols': details},
-            'disclaimer': f'등록 장기 테마·시가총액 {minimum / D(10**12):g}조원 이상 보통주 · 주봉 MA10 방향과 일봉 상승 추세 확인 · 4시간봉 BB(6,2) 하단 3% 구간 매수 · 평균가 -3% 손절 · 4시간봉 상단 또는 터치 후 최고가 -2% 매도 · 최대 5종목'}
+            'disclaimer': f'등록 장기 테마·시가총액 {minimum / D(10**12):g}조원 이상 보통주 · 주봉·일봉 추세 · 최근 20주와 20일 고저 범위 하위 40% · 4시간 BB(6,2) 하위 25% 및 하단 3% 이내에서 매수 추천 · 고점 종목은 추천·대기 목록에서 제외 · 평균가 -3% 손절 · 상단 + 예상 순수익 {engine.settings.swing_min_net_profit_percent:g}% 이상 익절 · 수익 기준 충족 후 최고가 -2% 보호 매도 · 최대 5종목'}

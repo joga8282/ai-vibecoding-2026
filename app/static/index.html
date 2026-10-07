@@ -12,7 +12,7 @@
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
   <link rel="stylesheet" href="/static/styles.css?v=0.3.8">
-  <script src="/static/app.js?v=0.7.8" defer></script>
+  <script src="/static/app.js?v=0.8.3" defer></script>
 </head>
 
 <body>
@@ -40,7 +40,7 @@
             <h2 id="engineLabel">중지됨</h2>
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
             <p id="autoBudgetStatus" class="muted">최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 추적 매도</p>
-            <p class="muted">매수 신호 시 총평가금액의 설정 비율로 1회 일괄 매수 · 종목별 분할매수 없음</p>
+            <p class="muted">LIVE 매수 예산은 최대 5종목에 균등 배분 · 종목당 총 투자예산의 1/5 이내 · 1주 예산 부족 시 제외</p>
             <p class="muted" id="tradingHoursHelp">주문 모드 확인 중</p>
             <p class="muted">최대 5종목 보유 · 5종목이면 기존 매도 조건으로 자리가 날 때까지 신규 매수 대기</p>
           </div>
@@ -77,21 +77,27 @@
       <dialog id="investmentSettingsDialog" class="investment-dialog" aria-labelledby="investmentSettingsTitle">
         <form id="investmentSettingsForm">
           <div class="panel-header">
-            <div><p class="eyebrow">POSITION SIZE</p><h2 id="investmentSettingsTitle">1회 매수 투자비율</h2></div>
+            <div><p class="eyebrow">POSITION SIZE</p><h2 id="investmentSettingsTitle">자동매매 총 투자예산 비율</h2></div>
             <button id="investmentSettingsClose" class="text-button" type="button">닫기</button>
           </div>
           <label class="investment-ratio-control" for="investmentRatioInput">
-            <span>총평가금액에서 한 번에 매수할 비율</span>
+            <span>자동매매에 사용할 총자산 비율</span>
             <strong id="investmentRatioValue">10%</strong>
           </label>
           <input id="investmentRatioInput" type="range" min="1" max="50" step="1" value="10">
-          <p id="investmentRatioHelp" class="muted">기본 10%. 매수 신호가 오면 이 비율만큼 한 번에 주문합니다. 종목별 분할매수는 하지 않으며, 최대 5종목까지 보유합니다. 보유 종목이 5개면 기존 매도 조건으로 자리가 날 때까지 신규 매수는 대기합니다.</p>
+          <p id="investmentRatioHelp" class="muted">총 투자예산의 자산 비율을 설정합니다. LIVE에서는 최대 5종목에 균등 배분하고 종목당 1/5 이내에서 수수료와 가용 현금으로 정수 수량을 계산합니다.</p>
           <div class="control-row investment-dialog-actions">
             <button id="investmentSettingsCancel" class="button button-secondary" type="button">취소</button>
             <button class="button button-primary" type="submit">저장</button>
           </div>
         </form>
       </dialog>
+
+      <section id="liveOrderReview" class="panel" hidden>
+        <div class="panel-header"><h2>미확인 실주문 검토</h2></div>
+        <p class="muted">토스 앱의 주문내역에서 접수·체결 여부를 확인하세요. 주문번호가 없는 오래된 미확인 주문은 미접수 확인 후 정리할 수 있습니다. 정리 후에는 계좌 동기화·무장이 필요합니다.</p>
+        <div id="liveOrderReviewList"></div>
+      </section>
 
       <section class="capital-bridge" aria-label="주문 자금 요약">
         <article class="panel capital-panel">
@@ -114,11 +120,17 @@
               <strong id="capitalRecommendationAmount">-</strong>
               <small id="capitalRecommendationHelp">설정된 추천 거래 비율 이내에서 가용 현금 사용</small>
               <label class="capital-ratio-control" for="capitalRatioInput">
-                <span>1회 매수 자산 비율</span>
+                <span>자동매매 총 투자예산 비율</span>
                 <strong id="capitalRatioValue">10%</strong>
               </label>
-              <input id="capitalRatioInput" type="range" min="1" max="50" step="1" value="10" aria-label="1회 매수 자산 비율" />
+              <input id="capitalRatioInput" type="range" min="1" max="50" step="1" value="10" aria-label="자동매매 총 투자예산 비율" />
               <small id="capitalRatioPreview">평가금액의 10% · 가용 현금 한도 적용</small>
+              <label class="capital-ratio-control" for="manualRatioInput">
+                <span>직접 매수 1회 총자산 비율</span>
+                <strong id="manualRatioValue">15%</strong>
+              </label>
+              <input id="manualRatioInput" type="range" min="1" max="15" step="1" value="15" aria-label="직접 매수 1회 총자산 비율" />
+              <small id="manualRatioPreview">직접 매수 비율은 자동매매 예산과 별도로 설정하며, 총자산 한도와 가용 현금을 적용합니다.</small>
               <button id="recommendationButton" class="button button-primary recommendation-button" type="button">추천 후보 찾기</button>
             </div>
           </div>
@@ -131,19 +143,19 @@
           <div class="strategy-grid">
             <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small>국내 보통주 · 시가총액 1조 원 이상</small></div>
             <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
-            <div><span>매수</span><strong>4시간봉 BB(6,2) 하단 3% 이내</strong><small>주봉·일봉 상승 방향을 먼저 확인, 주봉 스윙 전고점 5% 이내 제외</small></div>
-            <div><span>매도</span><strong>4시간봉 상단 또는 터치 후 -2%</strong><small>평균 매입가 -3% 손절 · 수동 전량매도 가능</small></div>
+            <div><span>매수</span><strong>최근 20주·20일 하위 40% · 4시간 BB 하위 25%</strong><small>주봉 저점 3% 하회·전고점 5% 이내 제외 · BB(6,2) 하단 3% 이내 · 주봉·일봉 추세 확인</small></div>
+            <div><span>매도</span><strong id="strategyExitValue">상단 + 예상 순수익 3% 이상 익절</strong><small id="strategyExitHelp">추적 기준에서 순수익 3% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도 · 평균 매입가 -3% 손절</small></div>
             <div><span>&#47588;&#49688;&#32;&#49884;&#44036;</span><strong>&#54217;&#51068;&#32;&#48;&#57;&#58;&#48;&#48;&#126;&#49;&#48;&#58;&#48;&#48;&#44;&#32;&#49;&#50;&#58;&#48;&#48;&#126;&#49;&#52;&#58;&#48;&#48;&#44;&#32;&#49;&#54;&#58;&#48;&#48;&#126;&#50;&#48;&#58;&#48;&#48;</strong><small>&#50528;&#54532;&#53552;&#47560;&#53011;&#32;&#51088;&#46041;&#32;&#47588;&#49688;&#32;&#48143;&#32;&#52572;&#49888;&#32;&#44144;&#47000;&#32;&#48516;&#48393;&#32;&#54869;&#51064;</small></div>
             <div><span>자금관리</span><strong>최대 5종목</strong><small id="strategyCapitalHelp">투자비율 확인 중</small></div>
             <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>
           </div>
-          <p class="muted">검색 결과에서 자동 매수 조건 통과 종목과 조건에 가까운 관찰 후보를 구분합니다. 관찰 후보는 자동 매수되지 않습니다.</p>
+          <p class="muted">매수 자리에 도달하고 모든 조건을 통과한 종목만 매수 추천합니다. 대기 목록은 매수 상한 3% 이내 종목이며 매수 추천이 아닙니다. 주봉·일봉 고점 구간은 두 목록에서 제외합니다.</p>
         </article>
         <div id="recommendationResults" class="recommendation-results" hidden>
           <div class="recommendation-header">
             <div>
               <p class="eyebrow" id="screeningEyebrow">SCREENING</p>
-              <h2>테마 스윙 매수 후보 TOP 5</h2>
+              <h2>매수 자리 도달 종목 TOP 5</h2>
             </div>
             <span id="recommendationBudget" class="badge badge-paper">-</span>
           </div>

@@ -4,6 +4,7 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.models import Candle, Currency, Side, Quote
+from app.engine import TradingEngine
 from app.swing_signals import four_hour_exit_signal, swing_signal, KST
 from app.swing_trader import SwingTrader
 from app.swing_recommendations import build_swing_recommendations
@@ -16,7 +17,7 @@ def history(now):
 
 
 def weekly_source(now):
-    return [Candle(now - timedelta(days=440-i), D(100+i*D('.1')), D(101+i*D('.1')),
+    return [Candle(now - timedelta(days=420-i), D(100+i*D('.1')), D(170+i*D('.1')),
                    D(99+i*D('.1')), D(100+i*D('.1')), D(1000), Currency.KRW)
             for i in range(420)]
 
@@ -44,12 +45,13 @@ class SignalTest(TestCase):
         four_hour = [Candle((self.now - timedelta(days=6-i//2)).replace(hour=9 if i % 2 == 0 else 13),
                             value, value, value, value, D(1000), Currency.KRW)
                      for i, value in enumerate(values)]
-        signal = swing_signal(self.daily, D(145), self.now, four_hour)
+        weekly = TradingEngine._aggregate_candles(weekly_source(self.now), '1w')
+        signal = swing_signal(self.daily, D(145), self.now, four_hour, weekly)
         self.assertTrue(signal['weekly_uptrend'])
         self.assertTrue(signal['daily_uptrend'])
         self.assertTrue(signal['eligible'])
         self.assertEqual(signal['conditions_passed'], 3)
-        self.assertFalse(swing_signal(self.daily, D(160), self.now, four_hour)['eligible'])
+        self.assertFalse(swing_signal(self.daily, D(160), self.now, four_hour, weekly)['eligible'])
 
     def test_four_hour_upper_touch_is_an_exit_signal(self):
         values = [D(100), D(101), D(102), D(103), D(104), D(105)]
@@ -233,7 +235,7 @@ class SwingTest(IsolatedAsyncioTestCase):
 
     async def test_recommendations_return_near_misses_when_no_exact_match(self):
         await self.setup_swing()
-        self.price = D(160)
+        self.price = D(149)
         with patch('app.swing_recommendations.load_universe', return_value=(D('1e12'), {'005930': ['테스트 테마']})):
             payload = await build_swing_recommendations(self.engine)
         self.assertFalse(payload['candidates'])
