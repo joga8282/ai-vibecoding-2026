@@ -5,6 +5,14 @@ from decimal import Decimal
 THEMES_PATH = Path(__file__).with_name('swing_themes.json')
 
 
+def market_cap_label(minimum):
+    unit, suffix = (Decimal('1e12'), '조 원') if minimum >= Decimal('1e12') else (Decimal('1e8'), '억 원')
+    amount = format(minimum / unit, ',f')
+    if '.' in amount:
+        amount = amount.rstrip('0').rstrip('.')
+    return amount + suffix
+
+
 def load_universe():
     data = json.loads(THEMES_PATH.read_text(encoding='utf-8'))
     minimum = Decimal(data['minimum_market_cap_krw'])

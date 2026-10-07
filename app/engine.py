@@ -43,6 +43,8 @@ class TradingEngine:
         self._buy_candles: dict[str, tuple[datetime, list[Candle]]] = {}
         self._four_hour_candles: dict[str, tuple[datetime, list[Candle]]] = {}
         self._weekly_candles: dict[str, tuple[datetime, list[Candle]]] = {}
+        self._candle_history_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._candle_cache_counts: dict[tuple[str, str], int] = {}
         self.buy_filter_status: dict[str, str] = {}
         self._stock_names: dict[str, tuple[datetime, str | None]] = {}
         self._stock_names_lock = asyncio.Lock()
@@ -174,17 +176,29 @@ class TradingEngine:
 
     async def candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         symbol = symbol.upper()
+        if interval in {'4h', '1w'}:
+            # A chart and an automatic scan must not duplicate the same large
+            # history fetch. Recheck the cache after the first caller finishes.
+            key = (symbol, interval)
+            lock = self._candle_history_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                return await self._load_candles(symbol, interval, count)
+        return await self._load_candles(symbol, interval, count)
+
+    async def _load_candles(self, symbol: str, interval: str, count: int) -> list[Candle]:
         now = datetime.now(timezone.utc)
         if interval == "4h":
             cached = self._four_hour_candles.get(symbol)
-            if cached and now - cached[0] < timedelta(minutes=4) and len(cached[1]) >= count:
+            capacity = self._candle_cache_counts.get((symbol, interval), len(cached[1]) if cached else 0)
+            if cached and now - cached[0] < timedelta(minutes=4) and capacity >= count:
                 return cached[1][-count:]
         elif interval == "1w":
             cached = self._weekly_candles.get(symbol)
             # Completed-week analysis does not need another multi-page daily
             # history fetch on every five-minute scan. Refresh the history
             # during the session, while still picking up a newly completed week.
-            if cached and now - cached[0] < timedelta(hours=6) and len(cached[1]) >= count:
+            capacity = self._candle_cache_counts.get((symbol, interval), len(cached[1]) if cached else 0)
+            if cached and now - cached[0] < timedelta(hours=6) and capacity >= count:
                 return cached[1][-count:]
         minute_intervals = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "50m": 50, "60m": 60, "4h": 240}
         base_interval = "1m" if interval in minute_intervals else "1d"
@@ -231,9 +245,11 @@ class TradingEngine:
             return sorted(source, key=lambda item: item.timestamp)[-count:]
         result = self._aggregate_candles(source, interval)[-count:]
         if interval == "4h":
-            self._four_hour_candles[symbol] = (now, result)
+            self._four_hour_candles[symbol] = (datetime.now(timezone.utc), result)
+            self._candle_cache_counts[(symbol, interval)] = count
         elif interval == "1w":
-            self._weekly_candles[symbol] = (now, result)
+            self._weekly_candles[symbol] = (datetime.now(timezone.utc), result)
+            self._candle_cache_counts[(symbol, interval)] = count
         return result
 
     @staticmethod

@@ -33,7 +33,7 @@ async function run() {
     renderStatus({mode: 'live', market_data: 'toss', running: true, kill_switch: false,
       live_readiness: {armed: true, reconciled: true},
       automation: {market_open: true, remaining: '140000', budget: '150000', spent: '10000'}}, state.risk);
-    renderRecommendations({budget: '140000', candidates: [
+    renderRecommendations({budget: '140000', minimum_market_cap_krw: '500000000000', candidates: [
       {symbol: '005930', name: 'mock', currency: 'KRW', price: '70000', quantity: 1},
       {symbol: '082740', name: 'restricted', currency: 'KRW', price: '40000', quantity: 1}],
       watchlist: [{symbol: '000001', name: 'watch', currency: 'KRW', price: '10000'}]}, false);
@@ -49,6 +49,9 @@ async function run() {
   })()`, context);
   assert.equal(element('#capitalMode').textContent, 'LIVE');
   assert.equal(element('#screeningEyebrow').textContent, 'LIVE SCREENING');
+  assert.equal(element('#strategyMarketCap').textContent, '국내 보통주 · 시가총액 5,000억 원 이상');
+  const html = fs.readFileSync(path.join(__dirname, '../app/static/index.html'), 'utf8');
+  assert.match(html, /id="strategyMarketCap">국내 보통주 · 시가총액 5,000억 원 이상/);
   assert.equal(element('#capitalRatioInput').max, '15');
   assert.match(element('#strategyExitValue').textContent, /예상 순수익 3% 이상 익절/);
   assert.match(element('#strategyExitHelp').textContent, /3% 미만에서도 가능/);
@@ -171,6 +174,40 @@ async function run() {
   assert.match(weeklyChart, /주봉 매수 관심 97 ~ 109/);
   assert.match(element('#candidateChartMeta').textContent, /주봉 BB\(20,2\)/);
   assert.equal(weeklyChart.split(context.expectedWeeklyBand).length - 1, 3);
-  console.log('LIVE dashboard rendering, route selection, confirmations and blocked buys: OK');
+  await vm.runInContext(`(async () => {
+    globalThis.chartTestBars = [{timestamp: '2026-10-06T09:00:00+09:00',
+      open_price: 100, high_price: 110, low_price: 90, close_price: 105, volume: 10}];
+    request = async url => {
+      if (url.includes('interval=4h')) return {candles: chartTestBars};
+      throw new Error('일봉 요청 제한');
+    };
+    await loadCandidateChart('082740', '한화엔진', '4h');
+  })()`, context);
+  assert.match(element('#candidateChartCanvas').innerHTML, /<svg/);
+  assert.match(element('#candidateChartMeta').textContent, /일봉 지표 조회 실패/);
+  await vm.runInContext(`(async () => {
+    request = async url => {
+      if (url.includes('interval=4h')) throw new Error('토스 캔들 조회 요청 한도를 초과했습니다. 3초 후 다시 조회해 주세요.');
+      return {candles: []};
+    };
+    await loadCandidateChart('082740', '한화엔진', '4h');
+  })()`, context);
+  assert.match(element('#candidateChartCanvas').innerHTML, /3초 후/);
+  assert.equal(element('#candidateChartMeta').textContent, '4시간봉 조회 실패');
+  await vm.runInContext(`(async () => {
+    const pending = [];
+    request = url => new Promise((resolve, reject) => pending.push({url, resolve, reject}));
+    const previous = loadCandidateChart('082740', '한화엔진', '4h');
+    const current = loadCandidateChart('082740', '한화엔진', '4h');
+    pending[2].resolve({candles: chartTestBars});
+    pending[3].resolve({candles: []});
+    await current;
+    pending[0].reject(new Error('이전 요청 실패'));
+    pending[1].resolve({candles: []});
+    await previous;
+  })()`, context);
+  assert.match(element('#candidateChartCanvas').innerHTML, /<svg/);
+  assert.doesNotMatch(element('#candidateChartCanvas').innerHTML, /이전 요청 실패/);
+  console.log('LIVE dashboard routes, strategy display and candle loading: OK');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

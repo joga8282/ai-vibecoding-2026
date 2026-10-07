@@ -352,6 +352,9 @@ function previewManualRatio(percent) {
 
 function renderRecommendations(payload, scroll = true) {
   state.recommendations = payload;
+  if (Number(payload.minimum_market_cap_krw) > 0) {
+    $("#strategyMarketCap").textContent = `국내 보통주 · 시가총액 ${marketCap(payload.minimum_market_cap_krw)} 이상`;
+  }
   const container = $("#recommendationResults");
   container.hidden = false;
   $("#recommendationBudget").textContent = `사용 금액 ${money(payload.budget, "KRW")}`;
@@ -569,6 +572,7 @@ function renderCandlestickChart(candles, interval, dailyCandles = []) {
 
 async function loadCandidateChart(symbol, name, interval = "1d") {
   chartState.symbol = symbol; chartState.name = name; chartState.interval = interval;
+  const loadId = chartState.loadId = (chartState.loadId || 0) + 1;
   const panel = $("#candidateChartPanel");
   panel.hidden = false;
   $("#candidateChartTitle").textContent = `${name} (${symbol})`;
@@ -582,9 +586,17 @@ async function loadCandidateChart(symbol, name, interval = "1d") {
   try {
     const chartRequest = request(`${API}/market/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&count=${count}`);
     const dailyRequest = request(`${API}/market/candles?symbol=${encodeURIComponent(symbol)}&interval=1d&count=300`);
-    const [payload, dailyPayload] = await Promise.all([chartRequest, dailyRequest]);
-    if (chartState.symbol === symbol && chartState.interval === interval) renderCandlestickChart(payload.candles || [], interval, dailyPayload.candles || []);
+    const [chartResult, dailyResult] = await Promise.allSettled([chartRequest, dailyRequest]);
+    if (chartState.loadId !== loadId || panel.hidden) return;
+    if (chartResult.status === 'rejected') throw chartResult.reason;
+    const daily = dailyResult.status === 'fulfilled' ? dailyResult.value.candles || [] : [];
+    renderCandlestickChart(chartResult.value.candles || [], interval, daily);
+    if (dailyResult.status === 'rejected') {
+      $('#candidateChartMeta').textContent += ' · 일봉 지표 조회 실패: 캔들만 표시';
+    }
   } catch (error) {
+    if (chartState.loadId !== loadId || panel.hidden) return;
+    $('#candidateChartMeta').textContent = `${chartLabels[interval]} 조회 실패`;
     $("#candidateChartCanvas").innerHTML = `<p class="recommendation-error">${escapeHtml(error.message)}</p>`;
   }
 }

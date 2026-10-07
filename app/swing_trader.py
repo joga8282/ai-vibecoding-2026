@@ -8,7 +8,7 @@ from app.models import Currency, Side, OrderStatus
 from app.paper import PaperBroker
 from app.swing_signals import four_hour_exit_signal, swing_signal, trend_context
 from app.swing_profit import estimate_exit_profit
-from app.swing_universe import load_universe, membership
+from app.swing_universe import load_universe, market_cap_label, membership
 
 
 class SwingTrader(MorningTrader):
@@ -235,7 +235,7 @@ class SwingTrader(MorningTrader):
             quote = await self.quote(symbol)
             stock = await asyncio.wait_for(self.engine.toss_client.stock_info(symbol), timeout=10)
             if not membership(stock, quote.price, minimum, themes):
-                raise RuntimeError('시가총액 또는 국내 보통주 조건을 충족하지 않습니다.')
+                raise RuntimeError(f'시가총액 {market_cap_label(minimum)} 이상 국내 보통주 조건을 충족하지 않습니다.')
             signal = await self.signal(symbol, quote)
             if not signal.get('eligible'):
                 raise RuntimeError('현재 자동매수 조건을 충족하지 않습니다.')
@@ -456,7 +456,7 @@ class SwingTrader(MorningTrader):
             quote = await self.quote(symbol)
             stock = await asyncio.wait_for(self.engine.toss_client.stock_info(symbol), timeout=10)
             if not membership(stock, quote.price, minimum, themes):
-                raise RuntimeError('시가총액 1조 원 이상 국내 보통주 조건을 충족하지 않습니다.')
+                raise RuntimeError(f'시가총액 {market_cap_label(minimum)} 이상 국내 보통주 조건을 충족하지 않습니다.')
             signal = await self.signal(symbol, quote)
             if signal.get('conditions_passed', 0) < 2:
                 raise RuntimeError('핵심 조건 3개 중 2개 이상 통과한 관찰 후보만 테스트할 수 있습니다.')

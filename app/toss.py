@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
+import random
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models import Candle, Currency, Quote, utc_now
 import websockets
@@ -23,6 +26,12 @@ class TossAPIError(RuntimeError):
         self.status = status
         self.path = path
         super().__init__(f"Toss API returned HTTP {status} for {path}.")
+
+
+class TossCandleRateLimitError(TossAPIError):
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = max(1, math.ceil(retry_after))
+        super().__init__(429, '/api/v1/candles')
 
 
 class TossOrderAPIError(urllib.error.HTTPError):
@@ -65,6 +74,13 @@ class TossMarketClient:
         self._token_lock = asyncio.Lock()
         self._stock_cache_lock = asyncio.Lock()
         self._korean_stocks: list[dict] | None = None
+        # Every symbol, chart and strategy shares the candle API quota.
+        self._candle_rate_lock = asyncio.Lock()
+        self._candle_interval = 0.25
+        self._candle_next_request = 0.0
+        self._candle_retry_at = 0.0
+        self._candle_clock = time.monotonic
+        self._candle_sleep = asyncio.sleep
 
     async def _access_token(self) -> str:
         if self._token and time.monotonic() < self._expires_at - 60:
@@ -421,25 +437,86 @@ class TossMarketClient:
         before: str | None = None
         candles: list[Candle] = []
         seen_timestamps: set[datetime] = set()
+        seen_cursors: set[str] = set()
         while remaining > 0:
-            page_size = min(remaining, 200)
-            page, next_before = await asyncio.to_thread(
-                self._candles_page_sync,
+            # The provider's cursor is inclusive: reserve one row for the
+            # boundary candle so a final single-row request can make progress.
+            page_size = min(remaining + (1 if before else 0), 200)
+            page, next_before = await self._candles_page(
                 token,
                 normalized,
                 interval,
                 page_size,
                 before,
             )
+            previous_count = len(candles)
             for candle in page:
                 if candle.timestamp not in seen_timestamps:
                     candles.append(candle)
                     seen_timestamps.add(candle.timestamp)
             remaining = count - len(candles)
-            if not page or not next_before or next_before == before:
+            if (len(candles) == previous_count or not next_before
+                    or next_before in seen_cursors):
                 break
+            seen_cursors.add(next_before)
             before = next_before
         return candles[:count]
+
+    @staticmethod
+    def _rate_number(headers, name):
+        try:
+            value = float(headers.get(name))
+            return value if math.isfinite(value) and value >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _update_candle_rate(self, headers):
+        limit = self._rate_number(headers, 'X-RateLimit-Limit')
+        if limit and limit > 0:
+            # Follow the current quota with 10% timing headroom, while keeping
+            # missing headers conservative and very high limits capped.
+            self._candle_interval = max(0.05, 1.1 / limit)
+        if self._rate_number(headers, 'X-RateLimit-Remaining') == 0:
+            reset = self._rate_number(headers, 'X-RateLimit-Reset') or self._candle_interval
+            self._candle_next_request = max(self._candle_next_request, self._candle_clock() + reset)
+
+    def _candle_retry_delay(self, headers, attempt):
+        retry = self._rate_number(headers, 'Retry-After')
+        if retry is None:
+            try:
+                date = parsedate_to_datetime(headers.get('Retry-After', ''))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                retry = max(0, (date - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                retry = 0
+        reset = self._rate_number(headers, 'X-RateLimit-Reset') or 0
+        return max(2 ** attempt, retry, reset) + random.uniform(0, 0.25)
+
+    async def _candles_page(self, token, symbol, interval, count, before):
+        for attempt in range(3):
+            async with self._candle_rate_lock:
+                delay = max(self._candle_next_request, self._candle_retry_at) - self._candle_clock()
+                # A long provider cooldown is reported instead of tying up a
+                # chart/strategy request or retrying earlier than requested.
+                if delay > 10:
+                    raise TossCandleRateLimitError(delay)
+                if delay > 0:
+                    await self._candle_sleep(delay)
+                self._candle_next_request = self._candle_clock() + self._candle_interval
+                try:
+                    return await asyncio.to_thread(
+                        self._candles_page_sync, token, symbol, interval, count, before)
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 429:
+                        raise
+                    headers = exc.headers or {}
+                    self._update_candle_rate(headers)
+                    retry = self._candle_retry_delay(headers, attempt)
+                    self._candle_retry_at = max(self._candle_retry_at, self._candle_clock() + retry)
+                    exc.close()
+                    if attempt == 2 or retry > 10:
+                        raise TossCandleRateLimitError(retry) from None
 
     def _candles_page_sync(
         self,
@@ -463,6 +540,7 @@ class TossMarketClient:
             headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=10) as response:
+            self._update_candle_rate(response.headers)
             payload = json.load(response)
         result = payload.get("result", {})
         candles = [

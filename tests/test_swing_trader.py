@@ -8,7 +8,7 @@ from app.engine import TradingEngine
 from app.swing_signals import four_hour_exit_signal, swing_signal, KST
 from app.swing_trader import SwingTrader
 from app.swing_recommendations import build_swing_recommendations
-from app.swing_universe import membership
+from app.swing_universe import load_universe, market_cap_label, membership
 from tests import test_paper_trader
 
 
@@ -97,6 +97,23 @@ class SignalTest(TestCase):
         self.assertFalse(membership(stock, D(100), D('1e13'), {}))
         stock['isCommonShare'] = False
         self.assertFalse(membership(stock, D(100), D('1e13'), {'005930': ['테마']}))
+
+    def test_configured_market_cap_is_five_hundred_billion_inclusive(self):
+        minimum, themes = load_universe()
+        self.assertEqual(minimum, D('500000000000'))
+        stock = {'symbol': '005930', 'securityType': 'STOCK', 'isCommonShare': True,
+                 'sharesOutstanding': '5000000000'}
+        self.assertTrue(membership(stock, D(100), minimum, themes))
+        self.assertFalse(membership(stock, D('99.9999999998'), minimum, themes))  # 1 won below.
+        self.assertTrue(membership(stock, D(150), minimum, themes))  # Below the old 1 trillion minimum.
+        self.assertFalse(membership(stock, D(100), minimum, {}))
+        stock['isCommonShare'] = False
+        self.assertFalse(membership(stock, D(100), minimum, themes))
+
+    def test_market_cap_label_follows_configured_units(self):
+        self.assertEqual(market_cap_label(D('500000000000')), '5,000억 원')
+        self.assertEqual(market_cap_label(D('1000000000000')), '1조 원')
+        self.assertEqual(market_cap_label(D('1e13')), '10조 원')
 
 
 class SwingTest(IsolatedAsyncioTestCase):
@@ -232,6 +249,66 @@ class SwingTest(IsolatedAsyncioTestCase):
         self.assertEqual(payload['candidates'][0]['strategy'], 'swing-v2-mtf-4h')
         self.assertEqual(payload['funnel']['universe'], 1)
         self.engine.toss_client.rankings.assert_not_called()
+
+    async def test_recommendations_accept_five_hundred_billion_to_one_trillion(self):
+        await self.setup_swing()
+        self.stock['sharesOutstanding'] = '4000000000'  # 580 billion at 145 won.
+        payload = await build_swing_recommendations(self.engine)
+        self.assertEqual([item['symbol'] for item in payload['candidates']], ['005930'])
+        self.assertEqual(payload['candidates'][0]['market_cap'], '580000000000')
+        self.assertEqual(payload['minimum_market_cap_krw'], '500000000000')
+        self.assertIn('시가총액 5,000억 원 이상', payload['disclaimer'])
+
+    async def test_recommendations_reject_below_five_hundred_billion_before_analysis(self):
+        await self.setup_swing()
+        self.stock['sharesOutstanding'] = '3000000000'  # 435 billion.
+        payload = await build_swing_recommendations(self.engine)
+        self.assertFalse(payload['candidates'])
+        self.assertFalse(payload['watchlist'])
+        self.assertEqual(payload['funnel']['risk_filtered'], 0)
+        self.engine.toss_client.candles.assert_not_awaited()
+        reason = payload['diagnostics']['symbols'][0]['reasons'][0]
+        self.assertIn('시가총액 5,000억 원 이상', reason)
+
+    async def test_automatic_buy_rechecks_the_new_market_cap_minimum(self):
+        await self.setup_swing()
+        self.stock['sharesOutstanding'] = '3000000000'
+        await self.auto.tick()
+        self.assertFalse(self.broker.orders)
+        self.now += timedelta(minutes=5)
+        self.stock['sharesOutstanding'] = '4000000000'
+        await self.auto.tick()
+        self.assertEqual([order.side for order in self.broker.orders], [Side.BUY])
+
+    async def test_direct_buy_rechecks_the_new_market_cap_minimum(self):
+        await self.setup_swing()
+        self.stock['sharesOutstanding'] = '3000000000'
+        with self.assertRaisesRegex(RuntimeError, '시가총액 5,000억 원 이상'):
+            await self.auto.buy_qualified('005930')
+        self.assertFalse(self.broker.orders)
+        self.stock['sharesOutstanding'] = '4000000000'
+        order = await self.auto.buy_qualified('005930')
+        self.assertEqual(order.side, Side.BUY)
+
+    async def test_paper_test_buy_rechecks_the_new_market_cap_minimum(self):
+        await self.setup_swing()
+        self.stock['sharesOutstanding'] = '3000000000'
+        with self.assertRaisesRegex(RuntimeError, '시가총액 5,000억 원 이상'):
+            await self.auto.test_buy('005930')
+        self.assertFalse(self.broker.orders)
+        self.stock['sharesOutstanding'] = '4000000000'
+        order = await self.auto.test_buy('005930')
+        self.assertEqual(order.quantity, D(1))
+
+    async def test_existing_holding_exit_still_runs_below_market_cap_minimum(self):
+        await self.setup_swing()
+        await self.auto.tick()
+        self.stock['sharesOutstanding'] = '1'
+        self.price = D(140)
+        self.now += timedelta(minutes=5)
+        await self.auto.tick()
+        self.assertEqual([order.side for order in self.broker.orders], [Side.BUY, Side.SELL])
+        self.assertFalse(self.broker.positions)
 
     async def test_recommendations_return_near_misses_when_no_exact_match(self):
         await self.setup_swing()

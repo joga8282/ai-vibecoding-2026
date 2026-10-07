@@ -189,6 +189,53 @@ class LiveDashboardTest(IsolatedAsyncioTestCase):
         self.assertIn('005930', self.broker.risk.recommended_symbols)
         self.assertIn('LIVE', self.auto.message)
 
+    async def test_live_direct_buy_accepts_market_cap_between_new_and_old_minimum(self):
+        self.broker.cash[Currency.KRW] = D(3000000)
+        self.client.stock_info.return_value = {
+            'symbol': '005930', 'securityType': 'STOCK', 'isCommonShare': True,
+            'sharesOutstanding': '8000000',  # 559.6 billion at the fresh quote.
+        }
+        result = self.order()
+        self.broker.place_market_order = AsyncMock(return_value=result)
+        with patch('app.swing_trader.swing_signal', return_value={'eligible': True}):
+            self.assertIs(await self.auto.buy_qualified('005930'), result)
+        self.broker.place_market_order.assert_awaited_once()
+        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(1))
+        self.client.create_order.assert_not_awaited()
+
+    async def test_live_direct_buy_rejects_market_cap_below_new_minimum(self):
+        self.broker.cash[Currency.KRW] = D(3000000)
+        self.client.stock_info.return_value = {
+            'symbol': '005930', 'securityType': 'STOCK', 'isCommonShare': True,
+            'sharesOutstanding': '7000000',  # 489.65 billion.
+        }
+        self.broker.place_market_order = AsyncMock()
+        with patch('app.swing_trader.swing_signal', return_value={'eligible': True}):
+            with self.assertRaisesRegex(RuntimeError, '주문 직전 매수 조건'):
+                await self.auto.buy_qualified('005930')
+        self.broker.place_market_order.assert_not_awaited()
+        self.client.create_order.assert_not_awaited()
+
+    async def test_live_automatic_buy_rechecks_the_new_market_cap_minimum(self):
+        self.broker.cash[Currency.KRW] = D(3000000)
+        self.client.stock_info.return_value = {
+            'symbol': '005930', 'securityType': 'STOCK', 'isCommonShare': True,
+            'sharesOutstanding': '7000000',
+        }
+        self.broker.place_market_order = AsyncMock(return_value=self.order())
+        await self.auto.restore()
+        await self.auto.prepare()
+        self.engine.running = True
+        with patch('app.swing_trader.swing_signal', return_value={'eligible': True}):
+            await self.auto.tick()
+            self.broker.place_market_order.assert_not_awaited()
+            self.client.stock_info.return_value['sharesOutstanding'] = '8000000'
+            self.auto.next_scan = self.auto.clock()
+            await self.auto.tick()
+        self.broker.place_market_order.assert_awaited_once()
+        self.assertEqual(self.broker.place_market_order.await_args.kwargs['quantity'], D(1))
+        self.client.create_order.assert_not_awaited()
+
     async def test_unqualified_disarmed_or_over_budget_live_buy_never_submits(self):
         self.broker.place_market_order = AsyncMock()
         self.broker.risk.armed = False

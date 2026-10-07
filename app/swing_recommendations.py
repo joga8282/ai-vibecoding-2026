@@ -5,7 +5,7 @@ from urllib.error import HTTPError, URLError
 
 from app.models import Currency
 from app.swing_signals import swing_signal, trend_context
-from app.swing_universe import load_universe, membership
+from app.swing_universe import load_universe, market_cap_label, membership
 
 
 async def build_swing_recommendations(engine):
@@ -25,7 +25,7 @@ async def build_swing_recommendations(engine):
     for symbol in symbols:
         stock, quote = stock_map.get(symbol), quote_map.get(symbol)
         if not quote or not membership(stock, quote.price, minimum, themes):
-            reason = '시가총액 1조원 이상 보통주 또는 시세·종목 정보 미충족'
+            reason = f'시가총액 {market_cap_label(minimum)} 이상 보통주 또는 시세·종목 정보 미충족'
             counts[reason] += 1
             details.append({'symbol': symbol, 'name': (stock or {}).get('name') or symbol,
                             'eligible': False, 'reasons': [reason]})
@@ -121,9 +121,10 @@ async def build_swing_recommendations(engine):
     watchlist.sort(key=lambda c: (-c.get('conditions_passed', 0), abs(D(c.get('band_distance_percent', '999'))), -D(c['market_cap'])))
     analyzed_count = sum(not isinstance(result, Exception) for result in results)
     return {'budget': str(remaining), 'per_symbol_budget': str(auto.buy_budget()),
+            'minimum_market_cap_krw': str(minimum),
             'candidates': candidates[:5], 'watchlist': watchlist[:5],
             'funnel': {'universe': len(symbols), 'budget_liquidity': len(quote_map),
                        'risk_filtered': len(eligible), 'analyzed': analyzed_count, 'qualified': len(candidates)},
             'diagnostics': {'analyzed_count': analyzed_count, 'qualified_count': len(candidates),
                             'rejection_counts': dict(counts), 'symbols': details},
-            'disclaimer': f'등록 장기 테마·시가총액 {minimum / D(10**12):g}조원 이상 보통주 · 주봉·일봉 추세 · 최근 20주와 20일 고저 범위 하위 40% · 4시간 BB(6,2) 하위 25% 및 하단 3% 이내에서 매수 추천 · 고점 종목은 추천·대기 목록에서 제외 · 평균가 -3% 손절 · 상단 + 예상 순수익 {engine.settings.swing_min_net_profit_percent:g}% 이상 익절 · 수익 기준 충족 후 최고가 -2% 보호 매도 · 최대 5종목'}
+            'disclaimer': f'등록 장기 테마·시가총액 {market_cap_label(minimum)} 이상 보통주 · 주봉·일봉 추세 · 최근 20주와 20일 고저 범위 하위 40% · 4시간 BB(6,2) 하위 25% 및 하단 3% 이내에서 매수 추천 · 고점 종목은 추천·대기 목록에서 제외 · 평균가 -3% 손절 · 상단 + 예상 순수익 {engine.settings.swing_min_net_profit_percent:g}% 이상 익절 · 수익 기준 충족 후 최고가 -2% 보호 매도 · 최대 5종목'}

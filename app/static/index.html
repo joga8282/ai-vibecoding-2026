@@ -12,7 +12,7 @@
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
   <link rel="stylesheet" href="/static/styles.css?v=0.3.8">
-  <script src="/static/app.js?v=0.8.3" defer></script>
+  <script src="/static/app.js?v=0.8.5" defer></script>
 </head>
 
 <body>
@@ -141,7 +141,7 @@
             <span class="badge badge-ok">SWING-V1</span>
           </div>
           <div class="strategy-grid">
-            <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small>국내 보통주 · 시가총액 1조 원 이상</small></div>
+            <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small id="strategyMarketCap">국내 보통주 · 시가총액 5,000억 원 이상</small></div>
             <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
             <div><span>매수</span><strong>최근 20주·20일 하위 40% · 4시간 BB 하위 25%</strong><small>주봉 저점 3% 하회·전고점 5% 이내 제외 · BB(6,2) 하단 3% 이내 · 주봉·일봉 추세 확인</small></div>
             <div><span>매도</span><strong id="strategyExitValue">상단 + 예상 순수익 3% 이상 익절</strong><small id="strategyExitHelp">추적 기준에서 순수익 3% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도 · 평균 매입가 -3% 손절</small></div>

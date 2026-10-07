@@ -26,7 +26,7 @@ from app.brokers.toss_real import TossRealBroker
 from app.repository import SnapshotRepository
 from app.recommendation_service import build_recommendations
 from app.swing_trader import SwingTrader
-from app.toss import TossMarketClient
+from app.toss import TossCandleRateLimitError, TossMarketClient
 from app.weekly_report import WeeklyReportService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -765,6 +765,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = get_engine(request)
         try:
             candles = await engine.candles(symbol, interval, count)
+        except TossCandleRateLimitError as exc:
+            engine.last_error = f"market-candles: {exc}"
+            raise HTTPException(
+                status_code=429,
+                detail=f'토스 캔들 조회 요청 한도를 초과했습니다. {exc.retry_after}초 후 다시 조회해 주세요.',
+                headers={'Retry-After': str(exc.retry_after)},
+            ) from exc
         except Exception as exc:
             engine.last_error = f"market-candles: {type(exc).__name__}: {exc}"
             raise HTTPException(
