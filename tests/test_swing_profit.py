@@ -41,6 +41,22 @@ class ProfitEstimateTest(TestCase):
         self.assertEqual(result['net_return_percent'].quantize(D('.01')), D('3.00'))
         self.assertFalse(result['meets_minimum'])
 
+    def test_gross_ten_percent_does_not_pass_net_ten_percent(self):
+        settings = replace(self.settings, swing_min_net_profit_percent=D(10))
+        result = estimate_exit_profit(self.position, D(110), settings)
+        self.assertFalse(result['meets_minimum'])
+        self.assertLess(result['net_return_percent'], D(10))
+        self.assertGreater(result['minimum_reference_price'], D(110))
+        self.assertTrue(estimate_exit_profit(self.position, D(111), settings)['meets_minimum'])
+
+    def test_ten_percent_boundary_does_not_round_up(self):
+        settings = replace(self.settings, swing_min_net_profit_percent=D(10),
+                           fee_rate=D(0), slippage_bps=D(0), live_sell_tax_rate=D(0))
+        self.assertTrue(estimate_exit_profit(self.position, D(110), settings)['meets_minimum'])
+        result = estimate_exit_profit(self.position, D('109.9999'), settings)
+        self.assertEqual(result['net_return_percent'].quantize(D('.01')), D('10.00'))
+        self.assertFalse(result['meets_minimum'])
+
     def test_paper_matches_paper_fee_model_without_live_tax(self):
         settings = replace(self.settings, mode='paper')
         result = estimate_exit_profit(self.position, D(104), settings)
@@ -177,6 +193,155 @@ class ProfitExitTest(IsolatedAsyncioTestCase):
         quote = Quote('005930', D(104), Currency.KRW, self.now, 'toss', D(104), D(105))
         with self.assertRaises(ConnectionError):
             await self.auto.exit_signal('005930', quote, self.position, self.day)
+
+
+class ProfitTargetChangeTest(IsolatedAsyncioTestCase):
+    asyncSetUp = ProfitExitTest.asyncSetUp
+    check = ProfitExitTest.check
+
+    def ten_percent(self):
+        self.engine.settings = replace(self.settings, swing_min_net_profit_percent=D(10),
+                                       swing_stop_loss_enabled=False)
+
+    async def restore_holding(self):
+        self.day['adopted'] = {'005930': {'quantity': '1', 'cost': '100'}}
+        self.engine.broker.positions['005930'] = self.position
+        await self.auto.save()
+        self.now += timedelta(days=1)
+        self.auto = SwingTrader(self.engine, AsyncMock(), lambda: self.now)
+        await self.auto.restore()
+        self.day = next(iter(self.auto.days.values()))
+
+    async def test_upper_below_ten_waits_and_ten_requires_upper(self):
+        self.ten_percent()
+        for price in ('103', '109.9999'):
+            with self.subTest(price=price):
+                signal = await self.check(price, upper=True)
+                self.assertFalse(signal['sell'])
+                self.assertFalse(signal['profit_trailing_armed'])
+        signal = await self.check('110', touch=False)
+        self.assertFalse(signal['sell'])
+        signal = await self.check('110', upper=True)
+        self.assertTrue(signal['take_profit'])
+        self.assertIn('10% 이상 익절', signal['exit_reason'])
+        self.assertEqual(self.day['targets']['005930']['last_exit_check']['min_net_profit_percent'], '10')
+
+    async def test_bid_and_costs_gate_ten_percent_exit(self):
+        self.ten_percent()
+        self.engine.settings = replace(self.engine.settings, fee_rate=D('.00015'),
+                                       slippage_bps=D(5), live_sell_tax_rate=D('.002'))
+        signal = await self.check('109.9', last='111', upper=True)
+        self.assertFalse(signal['sell'])
+        signal = await self.check('110', upper=True)
+        self.assertFalse(signal['sell'])
+        signal = await self.check('111', upper=True)
+        self.assertTrue(signal['take_profit'])
+
+    async def test_projected_trigger_must_leave_ten_percent_after_costs(self):
+        self.ten_percent()
+        self.engine.settings = replace(self.engine.settings, fee_rate=D('.00015'),
+                                       slippage_bps=D(5), live_sell_tax_rate=D('.002'))
+        signal = await self.check('112', high='112.4')
+        self.assertFalse(signal['profit_trailing_armed'])
+        self.assertLess(D(signal['estimated_trigger_net_return_percent']), D(10))
+        signal = await self.check('112', high='113')
+        self.assertTrue(signal['profit_trailing_armed'])
+        self.assertGreaterEqual(D(signal['estimated_trigger_net_return_percent']), D(10))
+
+    async def test_old_three_percent_activation_is_cleared_before_exit(self):
+        await self.check('104', high='106')
+        target = self.day['targets']['005930']
+        target.update(manual_qualified_buy=True, entered_at='original-entry')
+        self.ten_percent()
+        signal = await self.check('102', touch=False)
+        self.assertFalse(signal['sell'])
+        self.assertFalse(signal['profit_trailing_armed'])
+        self.assertNotIn('exit_peak', target)
+        self.assertNotIn('profit_trailing_armed_at', target)
+        self.assertTrue(target['manual_qualified_buy'])
+        self.assertEqual(target['entered_at'], 'original-entry')
+        self.assertEqual(target['profit_trailing_min_percent'], '10')
+
+    async def test_old_activation_is_cleared_and_saved_before_candle_failure(self):
+        await self.check('104', high='106')
+        self.ten_percent()
+        self.engine.candles.side_effect = ConnectionError('mock outage')
+        with self.assertRaises(ConnectionError):
+            await self.check('102', touch=False)
+        target = self.saved['swing_sessions']['days'][self.day['date']]['targets']['005930']
+        self.assertFalse(target['profit_trailing_armed'])
+        self.assertEqual(target['profit_trailing_min_percent'], '10')
+        self.assertNotIn('last_exit_check', target)
+
+    async def test_restart_migrates_open_holding_before_engine_starts(self):
+        await self.check('104', high='106')
+        self.ten_percent()
+        await self.restore_holding()
+        target = self.day['targets']['005930']
+        self.assertFalse(target['profit_trailing_armed'])
+        self.assertEqual(target['profit_trailing_min_percent'], '10')
+        self.assertNotIn('exit_peak', target)
+        self.assertEqual(self.auto.outstanding(self.day, '005930'), D(1))
+        saved = self.saved['swing_sessions']['days'][self.day['date']]['targets']['005930']
+        self.assertFalse(saved['profit_trailing_armed'])
+
+    async def test_closed_holding_history_is_preserved_on_restart(self):
+        await self.check('104', high='106')
+        before = deepcopy(self.day['targets']['005930'])
+        self.ten_percent()
+        self.auto = SwingTrader(self.engine, AsyncMock(), lambda: self.now)
+        await self.auto.restore()
+        self.assertEqual(self.auto.days[self.day['date']]['targets']['005930'], before)
+
+    async def test_legacy_or_invalid_activation_metadata_cannot_keep_old_protection(self):
+        self.ten_percent()
+        for previous in (None, '', 'NaN', 'Infinity', '-1', '101', 'invalid'):
+            with self.subTest(previous=previous):
+                target = {'profit_trailing_armed': True, 'exit_peak': '106', 'upper_band_touched': True}
+                if previous is not None:
+                    target['profit_trailing_min_percent'] = previous
+                self.day['targets']['005930'] = target
+                signal = await self.check('102', touch=False)
+                self.assertFalse(signal['sell'])
+                self.assertFalse(signal['profit_trailing_armed'])
+                self.assertEqual(target['profit_trailing_min_percent'], '10')
+
+    async def test_old_unarmed_peak_is_cleared_when_target_increases(self):
+        await self.check('104', high='105')
+        self.ten_percent()
+        signal = await self.check('109', touch=False)
+        self.assertFalse(signal['sell'])
+        self.assertNotIn('exit_peak', self.day['targets']['005930'])
+
+    async def test_historical_high_cannot_arm_after_price_already_crossed_trigger(self):
+        self.ten_percent()
+        signal = await self.check('109', high='114')
+        self.assertFalse(signal['profit_trailing_armed'])
+        self.assertFalse(signal['sell'])
+        self.assertGreater(D(signal['estimated_trigger_net_return_percent']), D(10))
+        signal = await self.check('113', high='114')
+        self.assertTrue(signal['profit_trailing_armed'])
+        self.assertFalse(signal['sell'])
+
+    async def test_ten_percent_protection_survives_restart_and_can_exit_below_target(self):
+        self.ten_percent()
+        signal = await self.check('113', high='114')
+        self.assertTrue(signal['profit_trailing_armed'])
+        await self.restore_holding()
+        self.engine.candles.side_effect = ConnectionError('mock outage')
+        signal = await self.check('109', touch=False)
+        self.assertTrue(signal['trailing_exit'])
+        self.assertLess(D(signal['estimated_net_return_percent']), D(10))
+        self.assertEqual(self.day['targets']['005930']['profit_trailing_min_percent'], '10')
+
+    async def test_lowering_target_keeps_existing_stricter_activation(self):
+        self.engine.settings = replace(self.settings, swing_min_net_profit_percent=D(12))
+        signal = await self.check('114', high='115')
+        self.assertTrue(signal['profit_trailing_armed'])
+        self.ten_percent()
+        signal = await self.check('109', touch=False)
+        self.assertTrue(signal['trailing_exit'])
+        self.assertEqual(self.day['targets']['005930']['profit_trailing_min_percent'], '12')
 
 
 class ExitCandleValidityTest(TestCase):

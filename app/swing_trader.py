@@ -8,14 +8,21 @@ from app.models import Currency, Side, OrderStatus
 from app.paper import PaperBroker
 from app.swing_signals import four_hour_exit_signal, swing_signal, trend_context
 from app.swing_profit import estimate_exit_profit
+from app.swing_averaging import SwingAveraging, TRAILING_KEYS
 from app.swing_universe import load_universe, market_cap_label, membership
 
 
 class SwingTrader(MorningTrader):
-    """Multi-day holdings; no time exit, intraday averaging or fixed profit target."""
+    """Multi-day holdings with configurable stops and one optional position addition."""
     strategy = 'swing-v2-mtf-4h'
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.averaging = SwingAveraging(self)
+
     async def restore(self):
+        if self.message == '가상 자동매매 시작 대기':
+            self.message = f'{self.engine.settings.mode.upper()} 스윙 자동매매 시작 대기'
         saved = await self.engine.repository.load('swing_sessions')
         if saved is None:
             legacy = await self.engine.repository.load('morning_sessions') or {}
@@ -27,9 +34,36 @@ class SwingTrader(MorningTrader):
             await self.save()
         else:
             self.days = saved.get('days', {})
+        await self.averaging.restore()
         await self.adopt_positions()
+        await self.averaging.refresh_results()
+        profit_policy_changed = False
+        for day in self.days.values():
+            for symbol, target in day.get('targets', {}).items():
+                if self.outstanding(day, symbol) > 0:
+                    profit_policy_changed |= self.reconcile_profit_target(target)
+        if profit_policy_changed:
+            await self.save()
         self.observation_count = await self.engine.repository.signal_observation_count()
         self.session = self.days.get(self.clock().date().isoformat())
+
+    def reconcile_profit_target(self, target):
+        """Discard a lower profit target's trailing state, keeping holding history."""
+        if not any(key in target for key in TRAILING_KEYS):
+            return False
+        minimum = self.engine.settings.swing_min_net_profit_percent
+        try:
+            # Snapshots predating activation metadata used the original 3% target.
+            previous = D(target.get('profit_trailing_min_percent', '3'))
+            valid = previous.is_finite() and D(0) <= previous <= D(100)
+        except (ArithmeticError, ValueError, TypeError):
+            valid = False
+        if valid and previous >= minimum:
+            return False
+        for key in TRAILING_KEYS:
+            target.pop(key, None)
+        target.update(profit_trailing_armed=False, profit_trailing_min_percent=str(minimum))
+        return True
 
     def outstanding(self, day, symbol):
         carried = D(day.get('adopted', {}).get(symbol, {}).get('quantity', '0'))
@@ -75,13 +109,15 @@ class SwingTrader(MorningTrader):
         budget = max(D(0), D(account['total_equity']['KRW']) * self.engine.settings.recommended_trade_ratio)
         if self.engine.settings.mode == 'live':
             broker = self.engine.broker
-            budget = min(budget, D(account['total_equity']['KRW']) * min(
-                self.engine.settings.live_max_total_exposure_ratio,
-                self.engine.settings.live_auto_max_total_exposure_ratio))
+            aggregate_budget = D(account['total_equity']['KRW']) * self.engine.settings.live_auto_exposure_ratio_limit
+            budget = (aggregate_budget if self.engine.settings.live_auto_allocation_mode == 'per_order'
+                      else min(budget, aggregate_budget))
             if self.engine.settings.live_max_total_exposure_krw > 0:
                 budget = min(budget, self.engine.settings.live_max_total_exposure_krw)
             invested = sum(broker.position_market_values.values(), D(0))
             pending = broker._pending_buy_exposure()
+            if pending is not None and self.engine.settings.live_auto_allocation_mode == 'per_order':
+                pending *= 1 + self.engine.settings.fee_rate
             remaining = max(D(0), min(D(account['cash']['KRW']), budget - invested - (pending or D(0)) - D(1)))
             if pending is None or not broker.reconciled or len(broker.positions) >= 5:
                 remaining = D(0)
@@ -93,7 +129,7 @@ class SwingTrader(MorningTrader):
         return budget, invested, remaining
 
     def buy_budget(self, symbol=None):
-        """Reserve one of five equal LIVE allocations, including fees."""
+        """Size one LIVE buy, reserving held symbols and pending buy slots."""
         budget, _, remaining = self.capital()
         if self.engine.settings.mode != 'live':
             return remaining
@@ -104,13 +140,20 @@ class SwingTrader(MorningTrader):
         }
         if len(reserved) >= 5 or (symbol and symbol.upper() in reserved):
             return D(0)
+        if self.engine.settings.live_auto_allocation_mode == 'per_order':
+            account = broker.account(self.engine.quotes)
+            per_order = D(account['total_equity']['KRW']) * min(
+                self.engine.settings.recommended_trade_ratio, self.engine.settings.live_auto_ratio_limit)
+            if self.engine.settings.live_auto_budget_split == 'remaining_slots':
+                per_order = min(per_order, remaining / D(5 - len(reserved)))
+            return max(D(0), min(remaining, per_order))
         return max(D(0), min(remaining, budget / D(5)))
 
     def manual_buy_budget(self, symbol=None, ratio=None):
         """Size a direct buy independently, within aggregate exposure and cash."""
         settings, broker = self.engine.settings, self.engine.broker
         ratio = settings.manual_trade_ratio if ratio is None else D(str(ratio))
-        maximum = settings.live_max_total_exposure_ratio if settings.mode == 'live' else D(1)
+        maximum = settings.live_manual_ratio_limit if settings.mode == 'live' else D(1)
         if not ratio.is_finite() or not D('.01') <= ratio <= maximum:
             raise RuntimeError(f'직접 매수 비율은 1%부터 {maximum * 100:g}% 사이여야 합니다.')
         account = broker.account(self.engine.quotes)
@@ -126,7 +169,9 @@ class SwingTrader(MorningTrader):
         if (pending is None or not broker.reconciled or len(reserved) >= 5
                 or (symbol and symbol.upper() in reserved)):
             return D(0)
-        exposure_limit = equity * settings.live_max_total_exposure_ratio
+        if settings.live_auto_allocation_mode == 'per_order':
+            pending *= 1 + settings.fee_rate
+        exposure_limit = equity * settings.live_exposure_ratio_limit
         if settings.live_max_total_exposure_krw > 0:
             exposure_limit = min(exposure_limit, settings.live_max_total_exposure_krw)
         invested = sum(broker.position_market_values.values(), D(0))
@@ -148,7 +193,7 @@ class SwingTrader(MorningTrader):
 
     def status(self):
         budget, invested, remaining = self.capital()
-        manual_maximum = (self.engine.settings.live_max_total_exposure_ratio
+        manual_maximum = (self.engine.settings.live_manual_ratio_limit
                           if self.engine.settings.mode == 'live' else D(1))
         manual_capacity = self.manual_buy_budget(ratio=manual_maximum) if manual_maximum >= D('.01') else D(0)
         if self.engine.kill_switch:
@@ -159,21 +204,75 @@ class SwingTrader(MorningTrader):
             execution_state = 'LIVE 주문 잠금 · 계좌 동기화·무장 및 미확인 주문을 확인하세요'
         elif not self.market_open():
             execution_state = '장외 대기 · 평일 정규장 및 16:00~20:00 애프터마켓에 검색합니다'
+        elif not self.engine.settings.swing_buy_window_limit_enabled:
+            execution_state = '매수·매도 감시 중 · 정규장·애프터마켓 전체에서 매수 조건 확인'
         else:
             execution_state = '매도 감시 중 · 자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00'
+        automatic_hours = ('평일 09:00~10:00, 12:00~14:00, 16:00~20:00'
+                           if self.engine.settings.swing_buy_window_limit_enabled
+                           else '평일 09:00~15:30, 16:00~20:00 · 별도 자동매수 시간 제한 해제')
         return {'strategy': self.strategy, 'budget': str(budget), 'spent': str(invested),
                 'remaining': str(remaining), 'message': self.message,
                 'per_symbol_budget': str(self.buy_budget()),
                 'manual_buy_capacity': str(manual_capacity),
                 'allocation_slots': 5 if self.engine.settings.mode == 'live' else None,
+                'allocation_mode': self.engine.settings.live_auto_allocation_mode if self.engine.settings.mode == 'live' else None,
+                'budget_split': self.engine.settings.live_auto_budget_split if self.engine.settings.mode == 'live' else None,
+                'remaining_allocation_slots': max(0, 5 - len(set(self.engine.broker.positions) | {
+                    str(order.get('symbol', '')).upper() for order in getattr(self.engine.broker, 'open_orders', [])
+                    if str(order.get('side', '')).upper() == 'BUY'})),
+                'buy_block_reasons': self.buy_block_reasons(budget, invested, remaining),
+                'averaging': self.averaging.status(),
                 'execution_state': execution_state, 'market_open': self.market_open(),
-                'trading_hours': f'자동매수 평일 09:00~10:00, 12:00~14:00, 16:00~20:00 · {self.engine.settings.mode.upper()} 수동매수·매도 평일 09:00~15:30, 16:00~20:00',
+                'buy_window_limit_enabled': self.engine.settings.swing_buy_window_limit_enabled,
+                'buy_window_open': self.buy_window_open(),
+                'trading_hours': f'자동매수 {automatic_hours} · {self.engine.settings.mode.upper()} 수동매수·매도 평일 09:00~15:30, 16:00~20:00',
                 'signal_observation_count': getattr(self, 'observation_count', 0),
                 'next_scan_at': max(self.clock(), self.next_scan).isoformat() if self.active() and self.market_open() else None,
                 'targets': [target for day in self.days.values() for target in day['targets'].values()
                             if target['symbol'] in self.engine.broker.positions],
                 'diagnostics': self.diagnostics(), 'weekly': self.report(),
                 'holding_count': len(self.engine.broker.positions), 'max_positions': 5}
+
+    def buy_block_reasons(self, budget, invested, remaining):
+        reasons = []
+        if not self.engine.running:
+            reasons.append('자동매매 엔진 중지')
+        if self.engine.kill_switch:
+            reasons.append('긴급 중지 활성')
+        if not self.market_open():
+            reasons.append('거래시간 외')
+        elif not self.buy_window_open():
+            reasons.append('자동매수 시간 외')
+        broker = self.engine.broker
+        if self.engine.settings.mode == 'live':
+            if not broker.reconciled:
+                reasons.append('실계좌 동기화 필요')
+            if not broker.risk.armed:
+                reasons.append('LIVE 무장 해제')
+            if not self.engine.settings.live_trading_enabled:
+                reasons.append('LIVE 주문 비활성화')
+            pending = broker._pending_buy_exposure()
+            if pending is None:
+                reasons.append('미체결 매수 금액 확인 필요')
+            elif remaining <= 0:
+                reserved_cost = pending * (1 + self.engine.settings.fee_rate) if self.engine.settings.live_auto_allocation_mode == 'per_order' else pending
+                if invested + reserved_cost + D(1) >= budget:
+                    reasons.append('총자산 대비 현금 유지 기준으로 신규 매수 예산 없음'
+                                   if self.engine.settings.live_min_cash_ratio > 0
+                                   else '보유 평가액·미체결 매수가 합산 투자 한도에 도달')
+                elif broker.cash[Currency.KRW] <= 0:
+                    reasons.append('가용 현금 부족')
+            reserved = set(broker.positions) | {
+                str(order.get('symbol', '')).upper() for order in broker.open_orders
+                if str(order.get('side', '')).upper() == 'BUY'}
+            if len(reserved) >= 5:
+                reasons.append('보유·미체결 매수 합계 최대 5종목 도달')
+            if broker.risk.daily_loss_limit_reached:
+                reasons.append('일일 손실 한도 도달')
+        elif remaining <= 0:
+            reasons.append('가용 매수 예산 없음')
+        return reasons
 
     def report(self):
         rows = []
@@ -206,6 +305,8 @@ class SwingTrader(MorningTrader):
         return now.weekday() < 5 and (regular_session or after_market)
 
     def buy_window_open(self):
+        if not self.engine.settings.swing_buy_window_limit_enabled:
+            return self.market_open()
         now = self.clock().astimezone(KST)
         current = now.time()
         regular_buy_window = time(9) <= current < time(10) or time(12) <= current < time(14)
@@ -362,8 +463,12 @@ class SwingTrader(MorningTrader):
         sell_price = quote.bid_price if settings.mode == 'live' else quote.price
         price_valid = sell_price is not None and sell_price.is_finite() and sell_price > 0
         target = day.setdefault('targets', {}).setdefault(symbol, {'symbol': symbol, 'name': symbol})
+        if self.reconcile_profit_target(target):
+            # Persist the change before candle I/O, which may fail.
+            await self.save()
+        target.setdefault('profit_trailing_min_percent', str(settings.swing_min_net_profit_percent))
         stop_percent = settings.live_max_position_loss_percent if settings.mode == 'live' else D('3')
-        stop_loss = bool(price_valid and position.average_price.is_finite() and position.average_price > 0
+        stop_loss = bool(settings.swing_stop_loss_enabled and price_valid and position.average_price.is_finite() and position.average_price > 0
                          and sell_price <= position.average_price * (D(1) - stop_percent / D(100)))
         try:
             four_hour = await asyncio.wait_for(self.engine.candles(symbol, '4h', 10), timeout=40)
@@ -392,14 +497,17 @@ class SwingTrader(MorningTrader):
         spread = max(D(0), quote.price - sell_price) if price_valid else D(0)
         trigger = max(D(0), peak * D('.98') - spread)
         trigger_profit = estimate_exit_profit(position, trigger, settings)
-        if (signal.get('ready') and target.get('upper_band_touched') and peak > 0
+        # Observe the price above the trigger before arming; a historical candle
+        # high cannot retroactively activate protection after the price has fallen.
+        if (signal.get('ready') and price_valid and sell_price > trigger
+                and target.get('upper_band_touched') and peak > 0
                 and trigger_profit['meets_minimum'] and target.get('profit_trailing_armed') is not True):
             target.update({'profit_trailing_armed': True, 'profit_trailing_armed_at': self.clock().isoformat(),
                            'profit_trailing_min_percent': str(settings.swing_min_net_profit_percent)})
         armed = target.get('profit_trailing_armed') is True
         trailing_exit = bool(price_valid and armed and peak > 0 and sell_price <= trigger)
         take_profit = bool(signal.get('sell_at_upper') and profit['meets_minimum'])
-        signal.update({'stop_loss': stop_loss, 'trailing_exit': trailing_exit,
+        signal.update({'stop_loss': stop_loss, 'stop_loss_enabled': settings.swing_stop_loss_enabled, 'trailing_exit': trailing_exit,
                        'take_profit': take_profit, 'profit_trailing_armed': armed,
                        'min_net_profit_percent': str(settings.swing_min_net_profit_percent),
                        'estimated_net_return_percent': str(profit['net_return_percent']) if profit['ready'] else None,
@@ -589,6 +697,7 @@ class SwingTrader(MorningTrader):
                         self.message = f'스윙 매도 확인 보류: {exc}'
                         self.session.setdefault('diagnostics', {})['last_error'] = str(exc)
                         await self.save()
+            await self.averaging.tick()
             try:
                 payload = await asyncio.wait_for(self.recommend(), timeout=75)
                 if self.engine.settings.mode == 'live':

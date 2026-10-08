@@ -127,4 +127,4 @@ async def build_swing_recommendations(engine):
                        'risk_filtered': len(eligible), 'analyzed': analyzed_count, 'qualified': len(candidates)},
             'diagnostics': {'analyzed_count': analyzed_count, 'qualified_count': len(candidates),
                             'rejection_counts': dict(counts), 'symbols': details},
-            'disclaimer': f'등록 장기 테마·시가총액 {market_cap_label(minimum)} 이상 보통주 · 주봉·일봉 추세 · 최근 20주와 20일 고저 범위 하위 40% · 4시간 BB(6,2) 하위 25% 및 하단 3% 이내에서 매수 추천 · 고점 종목은 추천·대기 목록에서 제외 · 평균가 -3% 손절 · 상단 + 예상 순수익 {engine.settings.swing_min_net_profit_percent:g}% 이상 익절 · 수익 기준 충족 후 최고가 -2% 보호 매도 · 최대 5종목'}
+            'disclaimer': f'등록 장기 테마·시가총액 {market_cap_label(minimum)} 이상 보통주 · 주봉·일봉 추세 · 최근 20주와 20일 고저 범위 하위 40% · 4시간 BB(6,2) 하위 25% 및 하단 3% 이내에서 매수 추천 · 고점 종목은 추천·대기 목록에서 제외 · {"고정 손절 사용 안 함" if not engine.settings.swing_stop_loss_enabled else "평균가 -3% 손절"} · {f"-{engine.settings.swing_averaging_trigger_percent:g}% 이하 보유분당 1회 추가 매수 · 기존 한도 적용" if engine.settings.swing_averaging_enabled else "추가 매수 없음"} · 상단 + 예상 순수익 {engine.settings.swing_min_net_profit_percent:g}% 이상 익절 · 수익 기준 충족 후 최고가 -2% 보호 매도 · 최대 5종목'}

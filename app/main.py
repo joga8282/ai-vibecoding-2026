@@ -121,17 +121,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if saved_ratio is not None:
             try:
                 ratio = Decimal(str(saved_ratio))
-                maximum = min(selected_settings.live_auto_max_total_exposure_ratio,
-                              selected_settings.live_max_total_exposure_ratio) if selected_settings.mode == 'live' else Decimal('.5')
+                maximum = selected_settings.live_auto_ratio_limit if selected_settings.mode == 'live' else Decimal('.5')
                 if ratio.is_finite() and Decimal('.01') <= ratio <= maximum:
                     selected_settings = replace(selected_settings, recommended_trade_ratio=ratio)
             except (ArithmeticError, ValueError, TypeError):
                 logging.getLogger(__name__).warning('Ignoring invalid saved investment ratio.')
         if selected_settings.mode == 'live':
             selected_settings = replace(selected_settings, recommended_trade_ratio=min(
-                selected_settings.recommended_trade_ratio, selected_settings.live_max_total_exposure_ratio,
-                selected_settings.live_auto_max_total_exposure_ratio))
-        manual_maximum = selected_settings.live_max_total_exposure_ratio if selected_settings.mode == 'live' else Decimal(1)
+                selected_settings.recommended_trade_ratio, selected_settings.live_auto_ratio_limit))
+        manual_maximum = selected_settings.live_manual_ratio_limit if selected_settings.mode == 'live' else Decimal(1)
         try:
             manual_ratio = Decimal(str(trading_preferences.get('manual_trade_ratio', selected_settings.manual_trade_ratio)))
             if not manual_ratio.is_finite() or not Decimal('.01') <= manual_ratio <= manual_maximum:
@@ -526,6 +524,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "recommended_trade_ratio": str(settings.recommended_trade_ratio),
             "manual_trade_ratio": str(settings.manual_trade_ratio),
             "swing_exit_policy": {
+                "stop_loss_enabled": settings.swing_stop_loss_enabled,
+                "stop_loss_percent": str(settings.live_max_position_loss_percent if settings.mode == 'live' else Decimal(3)),
                 "min_net_profit_percent": str(settings.swing_min_net_profit_percent),
                 "estimated_fee_rate": str(settings.fee_rate),
                 "estimated_sell_tax_rate": str(settings.live_sell_tax_rate if settings.mode == 'live' else Decimal(0)),
@@ -533,6 +533,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "trailing_drawdown_percent": "2",
                 "trailing_activation": "projected_net_profit_at_trigger",
                 "protective_exit_below_minimum": True,
+            },
+            "swing_averaging_policy": {
+                "enabled": settings.swing_averaging_enabled,
+                "trigger_loss_percent": str(settings.swing_averaging_trigger_percent),
+                "max_additions_per_position": 1,
+                "amount_basis": "initial_purchase_cost_with_estimated_fee",
+                "requires_fresh_entry_signal": False,
+                "resets_trailing_after_fill": True,
+                "live_order_type": "LIMIT",
             },
             "live_limits": {
                 "allowed_symbols": (sorted(getattr(getattr(engine.broker, 'risk', None), 'recommended_symbols', ()))
@@ -542,6 +551,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "max_total_exposure_krw": str(settings.live_max_total_exposure_krw),
                 "max_total_exposure_ratio": str(settings.live_max_total_exposure_ratio),
                 "auto_max_total_exposure_ratio": str(settings.live_auto_max_total_exposure_ratio),
+                "allocation_mode": settings.live_auto_allocation_mode,
+                "budget_split": settings.live_auto_budget_split,
+                "max_buy_ratio": str(settings.live_max_buy_ratio),
+                "min_cash_ratio": str(settings.live_min_cash_ratio),
+                "effective_total_exposure_ratio": str(settings.live_exposure_ratio_limit),
+                "effective_auto_exposure_ratio": str(settings.live_auto_exposure_ratio_limit),
+                "daily_loss_limit_enabled": settings.live_daily_loss_limit_enabled,
+                "max_daily_loss_krw": str(settings.live_max_daily_loss_krw),
+                "daily_loss_krw": str(engine.broker.risk.daily_loss),
+                "daily_loss_limit_reached": engine.broker.risk.daily_loss_limit_reached,
+                "daily_equity_date": engine.broker.daily_equity_date,
             } if settings.mode == 'live' else None,
         }
 
@@ -550,8 +570,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ratio = payload.ratio_percent / Decimal("100")
         if request.app.state.settings.mode == 'live':
             require_live_access(request)
-            maximum = min(request.app.state.settings.live_max_total_exposure_ratio,
-                          request.app.state.settings.live_auto_max_total_exposure_ratio) * 100
+            maximum = request.app.state.settings.live_auto_ratio_limit * 100
             if payload.ratio_percent > maximum:
                 raise HTTPException(status_code=422, detail=f'LIVE 자동매매 투자비율은 {maximum:g}% 이하로 설정하세요.')
         elif payload.ratio_percent > 50:
@@ -564,8 +583,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings = request.app.state.settings
         if settings.mode == 'live':
             require_live_access(request)
-            if payload.ratio_percent > settings.live_max_total_exposure_ratio * 100:
-                raise HTTPException(status_code=422, detail='직접 매수 비율은 LIVE 총자산 한도 이하여야 합니다.')
+            if payload.ratio_percent > settings.live_manual_ratio_limit * 100:
+                raise HTTPException(status_code=422, detail=f'직접 매수 비율은 {settings.live_manual_ratio_limit * 100:g}% 이하여야 합니다.')
         ratio = payload.ratio_percent / Decimal(100)
         await save_trade_ratio(request, 'manual_trade_ratio', ratio)
         return {'ratio_percent': str(payload.ratio_percent), 'manual_trade_ratio': str(ratio)}

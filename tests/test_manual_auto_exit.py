@@ -160,6 +160,40 @@ class LiveManualAutoExitTest(IsolatedAsyncioTestCase):
             return order
         self.broker.place_market_order = AsyncMock(side_effect=sell)
 
+    async def test_manual_holding_uses_ten_percent_target_after_restart(self):
+        settings = replace(self.settings, swing_min_net_profit_percent=D(10),
+                           swing_stop_loss_enabled=False)
+        self.engine.settings = self.broker.settings = self.broker.risk.settings = settings
+        self.broker.positions['005930'] = Position('005930', D(2), D(75000), Currency.KRW)
+        self.broker.position_market_values['005930'] = D(160000)
+        self.recommend.return_value = {'candidates': []}
+        self.book = Quote('005930', D(80050), Currency.KRW, datetime.now(timezone.utc),
+                          'toss', D(80000), D(80100))
+        self.broker._fresh_risk_quotes.return_value = [self.book]
+        self.mock_filled_sell()
+        self.engine.running = True
+        with patch('app.swing_trader.four_hour_exit_signal', return_value=upper_signal('80050')):
+            await self.auto.tick()
+        self.broker.place_market_order.assert_not_awaited()
+        adopted = next(day for day in self.auto.days.values() if day.get('adopted'))
+        check = adopted['targets']['005930']['last_exit_check']
+        self.assertEqual(check['min_net_profit_percent'], '10')
+        self.assertFalse(check['take_profit'])
+        self.assertEqual(self.auto.outstanding(adopted, '005930'), D(2))
+        self.auto = SwingTrader(self.engine, self.recommend, self.auto.clock)
+        await self.auto.restore()
+        self.engine.automation = self.auto
+        adopted = next(day for day in self.auto.days.values() if day.get('adopted'))
+        self.book = Quote('005930', D(85050), Currency.KRW, datetime.now(timezone.utc),
+                          'toss', D(85000), D(85100))
+        self.broker._fresh_risk_quotes.return_value = [self.book]
+        with patch('app.swing_trader.four_hour_exit_signal', return_value=upper_signal('85050')):
+            await self.auto.tick()
+        self.broker.place_market_order.assert_awaited_once()
+        self.assertFalse(self.broker.positions)
+        self.assertIn('10% 이상 익절', adopted['targets']['005930']['last_exit_check']['exit_reason'] or '')
+        self.client.create_order.assert_not_awaited()
+
     async def test_reconciliation_discovers_external_manual_buy_before_exit_scan(self):
         await self.auto.restore()  # Startup has no holdings.
         self.engine.running = True

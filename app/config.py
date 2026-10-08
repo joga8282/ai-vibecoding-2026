@@ -43,6 +43,10 @@ class Settings:
     fee_rate: Decimal = Decimal("0.00015")
     slippage_bps: Decimal = Decimal("5")
     swing_min_net_profit_percent: Decimal = Decimal("3")
+    swing_stop_loss_enabled: bool = True
+    swing_averaging_enabled: bool = False
+    swing_averaging_trigger_percent: Decimal = Decimal('15')
+    swing_buy_window_limit_enabled: bool = True
     live_sell_tax_rate: Decimal = Decimal("0.002")
     max_order_amount_krw: Decimal = Decimal("1000000")
     max_order_amount_usd: Decimal = Decimal("1000")
@@ -60,11 +64,33 @@ class Settings:
     live_max_total_exposure_krw: Decimal = Decimal("500000")
     live_max_total_exposure_ratio: Decimal = Decimal("0.15")
     live_auto_max_total_exposure_ratio: Decimal = Decimal("0.15")
+    live_auto_allocation_mode: str = 'equal_slots'
+    live_auto_budget_split: str = 'per_buy'
+    live_max_buy_ratio: Decimal = Decimal('0.15')
+    live_min_cash_ratio: Decimal = Decimal(0)
     live_max_daily_loss_krw: Decimal = Decimal("50000")
+    live_daily_loss_limit_enabled: bool = True
     live_max_position_loss_percent: Decimal = Decimal("3")
     live_allowed_symbols: tuple[str, ...] = ()
     live_symbol_policy: str = 'allowlist'
     api_access_token: str | None = None
+
+    @property
+    def live_exposure_ratio_limit(self) -> Decimal:
+        return min(self.live_max_total_exposure_ratio, 1 - self.live_min_cash_ratio)
+
+    @property
+    def live_auto_exposure_ratio_limit(self) -> Decimal:
+        return min(self.live_exposure_ratio_limit, self.live_auto_max_total_exposure_ratio)
+
+    @property
+    def live_manual_ratio_limit(self) -> Decimal:
+        return min(self.live_exposure_ratio_limit,
+                   self.live_max_buy_ratio if self.live_auto_allocation_mode == 'per_order' else Decimal(1))
+
+    @property
+    def live_auto_ratio_limit(self) -> Decimal:
+        return min(self.live_manual_ratio_limit, self.live_auto_max_total_exposure_ratio)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -75,12 +101,21 @@ class Settings:
         try:
             min_profit = Decimal(os.getenv('SWING_MIN_NET_PROFIT_PERCENT', '3'))
             sell_tax = Decimal(os.getenv('LIVE_SELL_TAX_RATE', '0.002'))
+            averaging_trigger = Decimal(os.getenv('SWING_AVERAGING_TRIGGER_PERCENT', '15'))
         except ArithmeticError as exc:
-            raise RuntimeError('Swing profit and sell-tax settings must be numbers.') from exc
+            raise RuntimeError('Swing profit, sell-tax and averaging settings must be numbers.') from exc
         if not min_profit.is_finite() or not Decimal(0) <= min_profit <= Decimal(100):
             raise RuntimeError('SWING_MIN_NET_PROFIT_PERCENT must be between 0 and 100.')
         if not sell_tax.is_finite() or not Decimal(0) <= sell_tax < Decimal(1):
             raise RuntimeError('LIVE_SELL_TAX_RATE must be between 0 and 1 (exclusive).')
+        if not averaging_trigger.is_finite() or not 0 < averaging_trigger < 100:
+            raise RuntimeError('SWING_AVERAGING_TRIGGER_PERCENT must be above 0 and below 100.')
+        averaging_enabled = _as_bool(os.getenv('SWING_AVERAGING_ENABLED'))
+        for key in ('SWING_STOP_LOSS_ENABLED', 'SWING_AVERAGING_ENABLED',
+                    'LIVE_DAILY_LOSS_LIMIT_ENABLED', 'SWING_BUY_WINDOW_LIMIT_ENABLED'):
+            raw = os.getenv(key)
+            if raw is not None and raw.strip().lower() not in {'1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'}:
+                raise RuntimeError(f'{key} must be an explicit boolean.')
         recommended_trade_ratio = Decimal(
             os.getenv("RECOMMENDED_TRADE_RATIO", "0.10")
         )
@@ -88,8 +123,26 @@ class Settings:
             raise RuntimeError("RECOMMENDED_TRADE_RATIO는 0부터 1 사이여야 합니다.")
         manual_trade_ratio = Decimal(os.getenv("MANUAL_TRADE_RATIO", "0.15"))
         auto_max_ratio = Decimal(os.getenv("LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO", "0.15"))
+        allocation_mode = os.getenv('LIVE_AUTO_ALLOCATION_MODE', 'equal_slots').strip().lower()
+        if allocation_mode not in {'equal_slots', 'per_order'}:
+            raise RuntimeError('LIVE_AUTO_ALLOCATION_MODE must be equal_slots or per_order.')
+        budget_split = os.getenv('LIVE_AUTO_BUDGET_SPLIT', 'per_buy').strip().lower()
+        if budget_split not in {'per_buy', 'remaining_slots'}:
+            raise RuntimeError('LIVE_AUTO_BUDGET_SPLIT must be per_buy or remaining_slots.')
+        if budget_split == 'remaining_slots' and allocation_mode != 'per_order':
+            raise RuntimeError('Remaining-slot allocation requires per_order mode.')
+        if mode == 'live' and averaging_enabled and allocation_mode != 'per_order':
+            raise RuntimeError('LIVE averaging requires per_order allocation and per-buy limits.')
+        try:
+            max_buy_ratio = Decimal(os.getenv('LIVE_MAX_BUY_RATIO', '0.15'))
+            min_cash_ratio = Decimal(os.getenv('LIVE_MIN_CASH_RATIO', '0'))
+        except ArithmeticError as exc:
+            raise RuntimeError('LIVE buy and cash reserve ratios must be numbers.') from exc
+        if not min_cash_ratio.is_finite() or not 0 <= min_cash_ratio < 1:
+            raise RuntimeError('LIVE_MIN_CASH_RATIO must be between 0 and 1 (exclusive).')
         for name, value in (("MANUAL_TRADE_RATIO", manual_trade_ratio),
-                            ("LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO", auto_max_ratio)):
+                            ("LIVE_AUTO_MAX_TOTAL_EXPOSURE_RATIO", auto_max_ratio),
+                            ('LIVE_MAX_BUY_RATIO', max_buy_ratio)):
             if not value.is_finite() or not Decimal('.01') <= value <= Decimal(1):
                 raise RuntimeError(f"{name} must be between 0.01 and 1.")
         database_path = Path(os.getenv(
@@ -135,6 +188,10 @@ class Settings:
             fee_rate=Decimal(os.getenv("FEE_RATE", "0.00015")),
             slippage_bps=Decimal(os.getenv("SLIPPAGE_BPS", "5")),
             swing_min_net_profit_percent=min_profit,
+            swing_stop_loss_enabled=_as_bool(os.getenv('SWING_STOP_LOSS_ENABLED'), default=True),
+            swing_averaging_enabled=averaging_enabled,
+            swing_averaging_trigger_percent=averaging_trigger,
+            swing_buy_window_limit_enabled=_as_bool(os.getenv('SWING_BUY_WINDOW_LIMIT_ENABLED'), default=True),
             live_sell_tax_rate=sell_tax,
             max_order_amount_krw=Decimal(os.getenv("MAX_ORDER_AMOUNT_KRW", "1000000")),
             max_order_amount_usd=Decimal(os.getenv("MAX_ORDER_AMOUNT_USD", "1000")),
@@ -154,7 +211,12 @@ class Settings:
             live_max_total_exposure_krw=live_limits["LIVE_MAX_TOTAL_EXPOSURE_KRW"],
             live_max_total_exposure_ratio=live_limits["LIVE_MAX_TOTAL_EXPOSURE_RATIO"],
             live_auto_max_total_exposure_ratio=auto_max_ratio,
+            live_auto_allocation_mode=allocation_mode,
+            live_auto_budget_split=budget_split,
+            live_max_buy_ratio=max_buy_ratio,
+            live_min_cash_ratio=min_cash_ratio,
             live_max_daily_loss_krw=live_limits["LIVE_MAX_DAILY_LOSS_KRW"],
+            live_daily_loss_limit_enabled=_as_bool(os.getenv('LIVE_DAILY_LOSS_LIMIT_ENABLED'), default=True),
             live_max_position_loss_percent=live_limits["LIVE_MAX_POSITION_LOSS_PERCENT"],
             live_allowed_symbols=tuple(filter(None, (s.strip().upper() for s in os.getenv("LIVE_ALLOWED_SYMBOLS", "").split(',')))),
             live_symbol_policy=symbol_policy,

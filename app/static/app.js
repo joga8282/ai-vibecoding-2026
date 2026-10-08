@@ -79,12 +79,42 @@ function money(value, currency) {
 }
 
 function liveExposureLabel(limits) {
-  const ratio = Number(limits?.max_total_exposure_ratio ?? 0.15);
+  const ratio = Number(limits?.effective_total_exposure_ratio ?? limits?.max_total_exposure_ratio ?? 0.15);
   return `총자산 ${ratio * 100}% ${ratio >= 1 ? "이내" : "미만"}`;
 }
 
 function liveOrderLimitLabel(limits) {
   return Number(limits?.max_order_amount_krw) > 0 ? money(limits.max_order_amount_krw, "KRW") : "가용 현금 한도";
+}
+
+function perOrderAllocation(limits) {
+  return limits?.allocation_mode === "per_order";
+}
+
+function remainingSlotAllocation(limits) {
+  return perOrderAllocation(limits) && limits?.budget_split === "remaining_slots";
+}
+
+function cashReserveLabel(limits) {
+  const percent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(Number(limits?.min_cash_ratio || 0) * 100);
+  return `총자산의 최소 ${percent}% 현금 유지`;
+}
+
+function stopLossLabel(risk = state.risk) {
+  return risk?.swing_exit_policy?.stop_loss_enabled === false
+    ? "고정 손절 사용 안 함" : `평균 매입가 -${Number(risk?.swing_exit_policy?.stop_loss_percent ?? 3)}% 손절`;
+}
+
+function averagingLabel(risk = state.risk) {
+  return risk?.swing_averaging_policy?.enabled
+    ? `-${Number(risk.swing_averaging_policy.trigger_loss_percent)}% 이하에서 최초 매입 원가 목표로 보유분당 1회 추가 매수 · 기존 비율·현금 한도 적용`
+    : "보유 종목 추가 매수 없음";
+}
+
+function liveBuyRatioLimit(limits, automatic = false) {
+  return Math.min(Number(limits?.effective_total_exposure_ratio ?? limits?.max_total_exposure_ratio ?? 0.15),
+    automatic ? Number(limits?.effective_auto_exposure_ratio ?? limits?.auto_max_total_exposure_ratio ?? 0.15) : 1,
+    perOrderAllocation(limits) ? Number(limits?.max_buy_ratio ?? 0.15) : 1) * 100;
 }
 
 function marketCap(value) {
@@ -146,14 +176,23 @@ function renderStatus(status, risk) {
     $("#engineDetail").textContent += ` · ${status.live_readiness.last_order_error}`;
   }
   const auto = status.automation;
+  const buyReasons = $("#autoBuyBlockReasons");
+  buyReasons.hidden = !(auto?.buy_block_reasons?.length);
+  buyReasons.textContent = auto?.buy_block_reasons?.length
+    ? `신규 종목 자동매수 대기 이유: ${auto.buy_block_reasons.join(" · ")}` : "";
   const minProfit = Number(risk?.swing_exit_policy?.min_net_profit_percent ?? 3);
   $("#strategyExitValue").textContent = `상단 + 예상 순수익 ${minProfit}% 이상 익절`;
-  $("#strategyExitHelp").textContent = `추적 기준에서 순수익 ${minProfit}% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도는 ${minProfit}% 미만에서도 가능 · 평균 매입가 -3% 손절`;
+  $("#strategyExitHelp").textContent = `추적 기준에서 순수익 ${minProfit}% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도는 ${minProfit}% 미만에서도 가능 · ${stopLossLabel(risk)}`;
+  $("#strategyAveragingHelp").textContent = averagingLabel(risk);
+  const averagingChecks = auto?.averaging?.checks || [];
+  $("#averagingStatus").hidden = !risk?.swing_averaging_policy?.enabled;
+  $("#averagingStatus").textContent = averagingChecks.length
+    ? averagingChecks.map(item => `${item.symbol}: ${item.reason}`).join(" · ") : "추가 매수 조건 확인 대기";
   if ($("#signalObservationCount")) $("#signalObservationCount").textContent = `${number(auto?.signal_observation_count || 0, "KRW")}건`;
   renderDiagnostics(auto?.diagnostics);
   $("#autoBudgetStatus").textContent = auto && Number(auto.budget) > 0
     ? `스윙 예산 ${money(auto.budget, "KRW")} · ${auto.holding_count ?? 0}/5종목 보유 · 보유 ${status.mode === "live" ? "평가액" : "원가"} ${money(auto.spent, "KRW")} · 매수 가능 ${money(auto.remaining, "KRW")}`
-    : `최대 5종목 · -3% 손절 · 상단 + 예상 순수익 ${minProfit}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도`;
+    : `최대 5종목 · ${stopLossLabel(risk)} · 상단 + 예상 순수익 ${minProfit}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도`;
   const weekly = auto?.weekly;
   $("#scalpSummary").textContent = weekly ? `누적 실현손익 ${money(weekly.realized_profit, "KRW")} · 청산 매수원가 대비 ${weekly.return_percent ?? "-"}% · 보유 중 제외` : "기록 대기";
   $("#scalpDays").innerHTML = (weekly?.days || []).map(day => `<tr><td>${escapeHtml(day.date)} · ${escapeHtml(day.name || day.symbol || "")}</td><td>${escapeHtml(day.status)}</td><td>${money(day.cost, "KRW")}</td><td>${day.profit === null ? "-" : money(day.profit, "KRW")}</td><td>${day.return_percent === null ? "-" : `${escapeHtml(day.return_percent)}%`}</td></tr>`).join("");
@@ -173,6 +212,14 @@ function renderStatus(status, risk) {
   $("#killButton").disabled = status.kill_switch;
   $("#clearKillButton").disabled = !status.kill_switch;
   $("#killSwitchLabel").textContent = status.kill_switch ? "긴급 중지" : "정상";
+  const dailyLossStatus = $("#dailyLossStatus");
+  const dailyLimits = risk?.live_limits;
+  dailyLossStatus.hidden = status.mode !== "live" || typeof dailyLimits?.daily_loss_limit_enabled !== "boolean";
+  dailyLossStatus.textContent = dailyLimits?.daily_loss_limit_enabled === false
+    ? `일일 손실 매수 제한 해제 · 당일 자산 감소 ${money(dailyLimits.daily_loss_krw, "KRW")}`
+    : `당일 자산 감소 ${money(dailyLimits?.daily_loss_krw, "KRW")} / 일일 한도 ${money(dailyLimits?.max_daily_loss_krw, "KRW")}${dailyLimits?.daily_loss_limit_reached ? " · 신규·추가 매수 보류" : ""}`;
+  $("#cashReserveStatus").hidden = status.mode !== "live" || !(Number(dailyLimits?.min_cash_ratio) > 0);
+  $("#cashReserveStatus").textContent = `신규·수동·추가 매수 시 ${cashReserveLabel(dailyLimits)} · 미체결·수수료 포함`;
   $("#killSwitchLabel").className = `metric-value small ${status.kill_switch ? "negative" : "positive"}`;
   $("#marketMode").textContent = status.market_data.toUpperCase();
   $("#marketMode").className = `badge ${status.market_data === "toss" ? "badge-ok" : "badge-muted"}`;
@@ -187,16 +234,30 @@ function renderStatus(status, risk) {
   $("#capitalAccountLabel").textContent = isPaper ? "가상계좌 평가금액" : "실계좌 평가금액";
   $("#capitalMode").textContent = isPaper ? "PAPER" : "LIVE";
   $("#investmentSettingsButton").disabled = false;
-  const maxRatio = isPaper ? 50 : Math.min(Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15),
-    Number(risk?.live_limits?.auto_max_total_exposure_ratio ?? 0.15)) * 100;
+  const allocationTitle = remainingSlotAllocation(risk?.live_limits) ? "자동 균등 배분 1회 최대 비율"
+    : perOrderAllocation(risk?.live_limits) ? "자동매수 1회 총자산 비율" : "자동매매 총 투자예산 비율";
+  $("#capitalRatioLabel").textContent = allocationTitle;
+  $("#investmentSettingsTitle").textContent = allocationTitle;
+  $("#autoAllocationHelp").textContent = isPaper ? "최대 5종목 · 설정 비율과 가용 현금으로 매수"
+    : remainingSlotAllocation(risk?.live_limits)
+      ? `${cashReserveLabel(risk?.live_limits)} · 남은 투자 가능 금액을 남은 보유 자리에 균등 배분 · 최대 5종목`
+    : perOrderAllocation(risk?.live_limits)
+      ? `1회 최대 ${liveBuyRatioLimit(risk?.live_limits, true)}% · 합산 ${liveExposureLabel(risk?.live_limits)} · 최대 5종목 · ${averagingLabel(risk)}`
+      : "LIVE 매수 예산은 최대 5종목에 균등 배분 · 종목당 총 투자예산의 1/5 이내 · 1주 예산 부족 시 제외";
+  const maxRatio = isPaper ? 50 : liveBuyRatioLimit(risk?.live_limits, true);
   $("#investmentRatioInput").max = String(maxRatio);
   $("#capitalRatioInput").max = String(maxRatio);
-  $("#manualRatioInput").max = String(isPaper ? 100 : Number(risk?.live_limits?.max_total_exposure_ratio ?? 0.15) * 100);
+  $("#manualRatioInput").max = String(isPaper ? 100 : liveBuyRatioLimit(risk?.live_limits));
   $("#investmentRatioHelp").textContent = isPaper
     ? "매수 신호가 오면 설정한 자산 비율과 가용 현금으로 주문합니다. 최대 5종목을 보유합니다."
-    : `총 투자예산을 최대 5종목에 균등 배분하여 종목당 1/5 이내에서 매수합니다. 보유 평가액·미체결 매수 합계에 ${liveExposureLabel(risk?.live_limits)}를 적용합니다. ${risk?.live_limits?.symbol_policy === "recommended" ? "최신 추천 조건 통과 종목만 매수합니다." : "종목 허용목록도 적용합니다."} 가용 현금·수수료를 적용하며 1주 예산이 부족한 종목은 건너뜁니다.`;
-  $("#tradingHoursHelp").textContent = `평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00 · 5분 간격 확인 · ${isPaper ? "PAPER" : "LIVE 실계좌"} 주문`;
-  $("#strategyCapitalHelp").textContent = isPaper ? "1회 매수 비율 설정 · PAPER" : `${liveExposureLabel(risk?.live_limits)} · LIVE`;
+    : `${perOrderAllocation(risk?.live_limits) ? `1회 매수는 설정한 비율로 계산하며 총자산의 최대 ${liveBuyRatioLimit(risk?.live_limits, true)}% 이내입니다.` : "총 투자예산을 최대 5종목에 균등 배분하여 종목당 1/5 이내에서 매수합니다."} 보유 평가액·미체결 매수 합계에 ${liveExposureLabel(risk?.live_limits)}를 적용합니다. ${risk?.live_limits?.symbol_policy === "recommended" ? "신규 종목은 최신 추천 조건 통과 종목만 매수합니다." : "종목 허용목록도 적용합니다."} 가용 현금·수수료를 적용하며 1주 예산이 부족한 종목은 건너뜁니다. 최대 5종목 · ${averagingLabel(risk)}.`;
+  if (!isPaper && remainingSlotAllocation(risk?.live_limits)) {
+    $("#investmentRatioHelp").textContent = `${cashReserveLabel(risk.live_limits)} 후 남은 예산을 보유·미체결을 제외한 남은 자리에 균등 배분합니다. 선택 비율은 1회 상한으로만 적용합니다. 최신 추천 조건과 실제 매수 호가를 재검사하며, 1주 예산이 부족한 종목은 건너뜁니다. 최대 5종목 · ${averagingLabel(risk)}.`;
+  }
+  $("#tradingHoursHelp").textContent = `${auto?.trading_hours || "평일 정규장 09:00~15:30 · 애프터마켓 16:00~20:00"} · 5분 간격 확인 · ${isPaper ? "PAPER" : "LIVE 실계좌"} 주문`;
+  $("#strategyCapitalHelp").textContent = isPaper ? "1회 매수 비율 설정 · PAPER" : `${perOrderAllocation(risk?.live_limits) ? `1회 최대 ${liveBuyRatioLimit(risk?.live_limits, true)}% · 합산 ` : ""}${liveExposureLabel(risk?.live_limits)} · LIVE`;
+  if (!isPaper && remainingSlotAllocation(risk?.live_limits)) $("#strategyCapitalHelp").textContent = `${cashReserveLabel(risk.live_limits)} · 남은 자리 균등 배분 · 최대 5종목 · LIVE`;
+  $("#capitalRatioInput").setAttribute("aria-label", allocationTitle);
   $("#screeningEyebrow").textContent = isPaper ? "PAPER SCREENING" : "LIVE SCREENING";
   $("#manualCloseHelp").textContent = isPaper
     ? "최신 거래 분봉으로 PAPER 전량 매도합니다. 당일 자동 재매수 제외"
@@ -234,6 +295,28 @@ function renderDiagnostics(diagnostics) {
   $("#diagnosticLastScan").textContent = `마지막 검색: ${lastScan}${data.last_error ? ` · 오류: ${data.last_error}` : ""}`;
 }
 
+function renderAssetBreakdown(account, totalEquity) {
+  const cashValue = account.cash?.KRW ?? account.buying_power?.KRW;
+  const hasAmount = value => value != null && String(value).trim() !== ""
+    && Number.isFinite(Number(value)) && Number(value) >= 0;
+  const cashKnown = hasAmount(cashValue);
+  const splitKnown = cashKnown && hasAmount(totalEquity) && Number(totalEquity) >= Number(cashValue);
+  const equity = Number(totalEquity);
+  const cash = Number(cashValue);
+  const invested = splitKnown ? equity - cash : null;
+  const share = amount => splitKnown && equity > 0
+    ? `· 총자산 ${new Intl.NumberFormat("ko-KR", {maximumFractionDigits: 1}).format(amount / equity * 100)}%` : "";
+  $("#krwInvested").textContent = splitKnown ? money(invested, "KRW") : "-";
+  $("#krwUninvested").textContent = cashKnown ? money(cash, "KRW") : "-";
+  $("#krwInvestedShare").textContent = share(invested);
+  $("#krwUninvestedShare").textContent = share(cash);
+  const notice = $("#krwAllocationNotice");
+  const stale = account.mode === "live" && account.data_status === "stale";
+  notice.hidden = splitKnown && !stale;
+  notice.textContent = stale ? "계좌 동기화 필요 · 마지막 확인 금액"
+    : splitKnown ? "" : "계좌 금액 확인 필요";
+}
+
 function renderAccount(account, performance) {
   state.account = account;
   state.performance = performance;
@@ -249,6 +332,7 @@ function renderAccount(account, performance) {
   $("#usdCash").textContent = money(cash.USD, "USD");
   $("#krwEquity").textContent = money(account.total_equity?.KRW ?? rows.KRW?.current_equity, "KRW");
   $("#usdEquity").textContent = money(account.total_equity?.USD ?? rows.USD?.current_equity, "USD");
+  renderAssetBreakdown(account, account.total_equity?.KRW ?? rows.KRW?.current_equity);
   for (const currency of ["KRW", "USD"]) {
     const target = $(`#${currency.toLowerCase()}Return`);
     if (isLive) {
@@ -273,7 +357,10 @@ function renderCapital(account, risk, status, performance) {
   const availableCash = Number(account.cash.KRW || 0);
   const tradeRatio = Number(risk.recommended_trade_ratio ?? 0.1);
   const hasSession = Number(status.automation?.budget) > 0;
-  const recommendationAmount = hasSession ? Number(status.automation.remaining) : Math.min(availableCash, accountAmount * tradeRatio);
+  const perOrder = !isPaper && perOrderAllocation(risk.live_limits);
+  const recommendationAmount = hasSession
+    ? Number(perOrder ? status.automation.per_symbol_budget ?? 0 : status.automation.remaining)
+    : Math.min(availableCash, accountAmount * tradeRatio);
   const ratioPercent = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 2 }).format(tradeRatio * 100);
   $("#investmentRatioInput").value = String(Math.round(tradeRatio * 100));
   $("#investmentRatioValue").textContent = `${ratioPercent}%`;
@@ -295,9 +382,17 @@ function renderCapital(account, risk, status, performance) {
     : `평가금액의 ${ratioPercent}%를 스윙 예산으로 사용 · 최대 5종목 · 종목별 주문 한도 적용`;
   $("#capitalRecommendationHelp").textContent = `총평가금액의 ${ratioPercent}%를 1회 매수 목표로 사용 · 분할매수 없음 · 최대 5종목`;
   if (!isPaper) {
-    const perSymbol = Number(status.automation?.per_symbol_budget || recommendationAmount / 5);
-    $("#capitalRecommendationHelp").textContent = `자동매매 총자산의 ${ratioPercent}% 예산에서 보유 평가액·미체결 매수를 차감 · 종목당 총 투자예산의 1/5, 현재 최대 ${money(perSymbol, "KRW")} · ${liveExposureLabel(risk.live_limits)} · ${liveOrderLimitLabel(risk.live_limits)}`;
-    $("#capitalRatioPreview").textContent = `${money(recommendationAmount, "KRW")} 현재 추가 매수 가능 예산`;
+    const perSymbol = Number(status.automation?.per_symbol_budget ?? recommendationAmount / 5);
+    $("#capitalRecommendationHelp").textContent = perOrder
+      ? `자동 1회 매수 총자산의 ${ratioPercent}% 이내 · 수수료 포함 최대 ${money(perSymbol, "KRW")} · 보유 평가액·미체결 합산 ${liveExposureLabel(risk.live_limits)} · 최대 5종목 · ${averagingLabel(risk)}`
+      : `자동매매 총자산의 ${ratioPercent}% 예산에서 보유 평가액·미체결 매수를 차감 · 종목당 총 투자예산의 1/5, 현재 최대 ${money(perSymbol, "KRW")} · ${liveExposureLabel(risk.live_limits)} · ${liveOrderLimitLabel(risk.live_limits)}`;
+    $("#capitalRatioPreview").textContent = perOrder
+      ? `1회 최대 ${money(perSymbol, "KRW")} · 합산 한도 내 잔여 예산 ${money(status.automation?.remaining ?? 0, "KRW")}`
+      : `${money(recommendationAmount, "KRW")} 현재 추가 매수 가능 예산`;
+    if (remainingSlotAllocation(risk.live_limits)) {
+      $("#capitalRecommendationHelp").textContent = `${cashReserveLabel(risk.live_limits)} · 보유 평가액·미체결·수수료 차감 후 남은 ${status.automation?.remaining_allocation_slots ?? 0}자리에 균등 배분 · 종목당 현재 최대 ${money(perSymbol, "KRW")} · ${averagingLabel(risk)}`;
+      $("#capitalRatioPreview").textContent = `균등 배분 1회 최대 ${money(perSymbol, "KRW")} · 현금 유지 후 잔여 예산 ${money(status.automation?.remaining ?? 0, "KRW")}`;
+    }
   }
 }
 
@@ -315,8 +410,15 @@ function buyBlockReason(symbol) {
 function candidateBuyBlockReason(item) {
   const blocked = buyBlockReason(item.symbol);
   if (blocked || state.status?.mode !== "live") return blocked;
-  if (state.account?.positions?.some(position => position.symbol === item.symbol)) return "보유 중 · 추가 매수 없음";
+  if (state.account?.positions?.some(position => position.symbol === item.symbol)) return state.risk?.swing_averaging_policy?.enabled ? "보유 중 · 추가 매수는 자동 조건으로만 실행" : "보유 중 · 추가 매수 없음";
   return manualQuantity(item) < 1 ? "직접 매수 예산으로 1주 매수 불가" : "";
+}
+
+function candidateAutomaticBuyBlockReason(item) {
+  if (state.status?.mode !== "live") return "";
+  if (state.account?.positions?.some(position => position.symbol === item.symbol)) return state.risk?.swing_averaging_policy?.enabled ? "보유 중 · 추가 매수는 자동 조건으로만 실행" : "보유 중 · 추가 매수 없음";
+  if (Number(item.quantity) < 1) return "자동매수 예산으로 1주 매수 불가";
+  return "";
 }
 
 function manualRatioPercent() {
@@ -357,7 +459,9 @@ function renderRecommendations(payload, scroll = true) {
   }
   const container = $("#recommendationResults");
   container.hidden = false;
-  $("#recommendationBudget").textContent = `사용 금액 ${money(payload.budget, "KRW")}`;
+  $("#recommendationBudget").textContent = perOrderAllocation(state.risk?.live_limits)
+    ? `1회 최대 ${money(payload.per_symbol_budget ?? state.status?.automation?.per_symbol_budget ?? 0, "KRW")} · 합산 잔여 ${money(payload.budget, "KRW")}`
+    : `사용 금액 ${money(payload.budget, "KRW")}`;
   $("#recommendationDisclaimer").textContent = payload.disclaimer;
   const funnel = payload.funnel || {};
   $("#recommendationFunnel").textContent = `${new Date().toLocaleTimeString("ko-KR")} 조회 완료 · 등록 테마 ${number(funnel.universe || 0, "KRW")}개 → 시세 확인 ${number(funnel.budget_liquidity || 0, "KRW")}개 → 대형주 필터 ${number(funnel.risk_filtered || 0, "KRW")}개 → 지표 분석 ${number(funnel.analyzed || 0, "KRW")}개 → 조건 충족 ${number(funnel.qualified ?? payload.candidates.length, "KRW")}개`;
@@ -368,7 +472,7 @@ function renderRecommendations(payload, scroll = true) {
         <span class="recommendation-symbol">${escapeHtml(item.symbol)}</span>
         <div class="recommendation-price">${money(item.price, item.currency)}</div>
         <div class="recommendation-metrics">
-          ${String(item.strategy || "").startsWith("swing-v") ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>주봉 관심 가격 ${number(item.weekly_support_floor, item.currency)} ~ ${number(item.weekly_entry_ceiling, item.currency)} · 최근 20주 하위 40%</div><div>4시간봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 밴드 하위 25% 및 하단 3% 이내</div><div>최근 20일 고저 범위 하위 40% · 최종 매수 상한 ${number(item.entry_ceiling, item.currency)}</div><div>손절 평균 매입가 -3% · 상단 + 예상 순수익 ${Number(state.risk?.swing_exit_policy?.min_net_profit_percent ?? 3)}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도</div><div>주봉 MA10 ${number(item.weekly_ma10, item.currency)} · 일봉 MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>주봉·일봉 방향 확인 · 최대 5종목 · 다일 보유</div>` : `
+          ${String(item.strategy || "").startsWith("swing-v") ? `<div>테마 ${escapeHtml((item.themes || []).join(" · "))}</div><div>시가총액 ${marketCap(item.market_cap)}</div><div>주봉 관심 가격 ${number(item.weekly_support_floor, item.currency)} ~ ${number(item.weekly_entry_ceiling, item.currency)} · 최근 20주 하위 40%</div><div>4시간봉 볼린저 하단 ${number(item.bollinger_lower, item.currency)} · 밴드 하위 25% 및 하단 3% 이내</div><div>최근 20일 고저 범위 하위 40% · 최종 매수 상한 ${number(item.entry_ceiling, item.currency)}</div><div>${escapeHtml(stopLossLabel())} · ${escapeHtml(averagingLabel())} · 상단 + 예상 순수익 ${Number(state.risk?.swing_exit_policy?.min_net_profit_percent ?? 3)}% 이상 익절 · 수익 기준 충족 후 고점 -2% 보호 매도</div><div>주봉 MA10 ${number(item.weekly_ma10, item.currency)} · 일봉 MA20 ${number(item.ma20, item.currency)} · MA60 ${number(item.ma60, item.currency)}</div><div>주봉·일봉 방향 확인 · 최대 5종목 · 다일 보유</div>` : `
           <div>시가총액 ${marketCap(item.market_cap)}</div>
           <div>일봉 지지 ${number(item.daily_support, item.currency)} · 저항 ${number(item.daily_resistance, item.currency)}</div>
           <div>주봉 지지 ${number(item.weekly_support, item.currency)} · 저항 ${number(item.weekly_resistance, item.currency)}</div>
@@ -383,7 +487,8 @@ function renderRecommendations(payload, scroll = true) {
           `}
         </div>
         <p class="recommendation-reason">${escapeHtml(item.reason)}</p>
-        <div class="recommendation-quantity">자동 배분 최대 ${number(item.quantity, "KRW")}주 · 직접 ${manualRatioPercent()}% 선택 시 예상 ${number(manualQuantity(item), "KRW")}주</div>
+        <div class="recommendation-quantity">${remainingSlotAllocation(state.risk?.live_limits) ? "자동 균등 배분 최대" : perOrderAllocation(state.risk?.live_limits) ? "자동 1회 최대" : "자동 배분 최대"} ${number(item.quantity, "KRW")}주 · 직접 ${manualRatioPercent()}% 선택 시 예상 ${number(manualQuantity(item), "KRW")}주</div>
+        ${candidateAutomaticBuyBlockReason(item) ? `<p class="muted">자동매수 제외: ${escapeHtml(candidateAutomaticBuyBlockReason(item))}</p>` : ""}
         <button type="button" class="button button-primary full" data-qualified-buy="${escapeHtml(item.symbol)}" ${candidateBuyBlockReason(item) ? "disabled" : ""}>${escapeHtml(candidateBuyBlockReason(item) || (state.status?.mode === "live" ? "LIVE 실계좌 조건 확인·매수" : "조건 통과 종목 자산 비율 매수"))}</button>
       </article>`).join("")
     : '<p class="empty">자동 매수 조건을 모두 통과한 종목은 없습니다.</p>';
@@ -773,9 +878,16 @@ async function loadAll(silent = false) {
     if (state.status?.mode === "live") {
       $("#accountModeBadge").textContent = "LIVE · SYNC FAILED";
       $("#accountModeBadge").title = error.message;
+      $("#krwAllocationNotice").hidden = false;
+      $("#krwAllocationNotice").textContent = state.account
+        ? "계좌 조회 실패 · 마지막 확인 금액" : "계좌 조회 실패";
       if (!state.account) {
         $("#krwEquity").textContent = "조회 불가";
         $("#usdEquity").textContent = "조회 불가";
+        $("#krwInvested").textContent = "조회 불가";
+        $("#krwUninvested").textContent = "조회 불가";
+        $("#krwInvestedShare").textContent = "";
+        $("#krwUninvestedShare").textContent = "";
       }
     }
     if (!silent) toast(error.message, true);
@@ -815,7 +927,7 @@ $("#capitalRatioInput").addEventListener("change", async event => {
   slider.disabled = true;
   try {
     await saveInvestmentRatio(Number(slider.value));
-    toast(`총 투자예산 비율을 ${slider.value}%로 저장했습니다.`);
+    toast(`${perOrderAllocation(state.risk?.live_limits) ? "자동매수 1회" : "총 투자예산"} 비율을 ${slider.value}%로 저장했습니다.`);
     await loadAll(true);
   } catch (error) {
     toast(error.message, true);
@@ -847,7 +959,7 @@ $("#investmentSettingsForm").addEventListener("submit", async event => {
     const ratioPercent = Number($("#investmentRatioInput").value);
     await saveInvestmentRatio(ratioPercent);
     investmentSettingsDialog.close();
-    toast(`총 투자예산 비율을 ${ratioPercent}%로 저장했습니다.`);
+    toast(`${perOrderAllocation(state.risk?.live_limits) ? "자동매수 1회" : "총 투자예산"} 비율을 ${ratioPercent}%로 저장했습니다.`);
     await loadAll(true);
   } catch (error) {
     toast(error.message, true);
@@ -860,7 +972,13 @@ function previewInvestmentRatio(percent) {
   const equity = Number(state.performance?.by_currency?.KRW?.current_equity || state.account?.total_equity?.KRW || 0);
   const cash = Number(state.account?.cash?.KRW || 0);
   const amount = Math.min(cash, equity * Number(percent) / 100);
-  const liveRemaining = Math.max(0, Math.min(cash, equity * Number(percent) / 100 - Number(state.status?.automation?.spent || 0) - 1));
+  let liveRemaining = perOrderAllocation(state.risk?.live_limits)
+    ? Math.max(0, Math.min(amount, Number(state.status?.automation?.remaining ?? 0)))
+    : Math.max(0, Math.min(cash, equity * Number(percent) / 100 - Number(state.status?.automation?.spent || 0) - 1));
+  if (remainingSlotAllocation(state.risk?.live_limits)) {
+    const slots = Number(state.status?.automation?.remaining_allocation_slots ?? 0);
+    liveRemaining = slots > 0 ? Math.min(liveRemaining, Number(state.status.automation.remaining) / slots) : 0;
+  }
   $("#capitalRatioPreview").textContent = state.status?.mode === "live"
     ? `${money(liveRemaining, "KRW")} 예상 예산 · 미체결 매수·주문 한도는 서버에서 재검사`
     : `${money(amount, "KRW")} 예상 주문 예산 · 가용 현금 한도 적용`;

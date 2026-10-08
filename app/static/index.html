@@ -11,8 +11,8 @@
     try { document.documentElement.dataset.theme = localStorage.getItem("trader-theme") || "dark"; }
     catch { document.documentElement.dataset.theme = "dark"; }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.3.8">
-  <script src="/static/app.js?v=0.8.5" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=0.3.9">
+  <script src="/static/app.js?v=0.8.12" defer></script>
 </head>
 
 <body>
@@ -39,8 +39,10 @@
             <p class="eyebrow">거래 엔진</p>
             <h2 id="engineLabel">중지됨</h2>
             <p id="engineDetail" class="muted">상태를 불러오는 중입니다.</p>
-            <p id="autoBudgetStatus" class="muted">최대 5종목 · -3% 손절 · 4시간봉 눌림목 매수 / 상단 추적 매도</p>
-            <p class="muted">LIVE 매수 예산은 최대 5종목에 균등 배분 · 종목당 총 투자예산의 1/5 이내 · 1주 예산 부족 시 제외</p>
+            <p id="autoBuyBlockReasons" class="muted" hidden></p>
+            <p id="averagingStatus" class="muted" hidden></p>
+            <p id="autoBudgetStatus" class="muted">최대 5종목 · 매수·매도 설정을 불러오는 중</p>
+            <p id="autoAllocationHelp" class="muted">매수 예산 확인 중 · 최대 5종목 · 1주 예산 부족 시 제외</p>
             <p class="muted" id="tradingHoursHelp">주문 모드 확인 중</p>
             <p class="muted">최대 5종목 보유 · 5종목이면 기존 매도 조건으로 자리가 날 때까지 신규 매수 대기</p>
           </div>
@@ -56,6 +58,19 @@
           <p class="metric-label">KRW 총평가금액</p>
           <p id="krwEquity" class="metric-value">-</p>
           <p id="krwReturn" class="metric-change">-</p>
+          <dl class="asset-breakdown" aria-label="원화 투자·미투자 자산 구분">
+            <div class="asset-breakdown-item asset-invested">
+              <dt>투자 총금액</dt>
+              <dd id="krwInvested" class="asset-breakdown-value">-</dd>
+              <dd class="asset-breakdown-help">보유 주식 평가금액 <span id="krwInvestedShare"></span></dd>
+            </div>
+            <div class="asset-breakdown-item asset-uninvested">
+              <dt>미투자 자산 총금액</dt>
+              <dd id="krwUninvested" class="asset-breakdown-value">-</dd>
+              <dd class="asset-breakdown-help">주문 가능한 현금 <span id="krwUninvestedShare"></span></dd>
+            </div>
+          </dl>
+          <p id="krwAllocationNotice" class="metric-change" hidden></p>
         </article>
         <article class="metric-card">
           <p class="metric-label">USD 총자산</p>
@@ -66,6 +81,8 @@
           <div>
             <p class="metric-label">안전장치</p>
             <p id="killSwitchLabel" class="metric-value small">정상</p>
+            <p id="dailyLossStatus" class="muted" hidden></p>
+            <p id="cashReserveStatus" class="muted" hidden></p>
           </div>
           <div class="control-row compact">
             <button id="killButton" class="button button-danger" type="button">긴급 중지</button>
@@ -120,7 +137,7 @@
               <strong id="capitalRecommendationAmount">-</strong>
               <small id="capitalRecommendationHelp">설정된 추천 거래 비율 이내에서 가용 현금 사용</small>
               <label class="capital-ratio-control" for="capitalRatioInput">
-                <span>자동매매 총 투자예산 비율</span>
+                <span id="capitalRatioLabel">자동매매 총 투자예산 비율</span>
                 <strong id="capitalRatioValue">10%</strong>
               </label>
               <input id="capitalRatioInput" type="range" min="1" max="50" step="1" value="10" aria-label="자동매매 총 투자예산 비율" />
@@ -144,7 +161,7 @@
             <div><span>검색 대상</span><strong>등록 테마 44종목</strong><small id="strategyMarketCap">국내 보통주 · 시가총액 5,000억 원 이상</small></div>
             <div><span>상승추세</span><strong>MA20 &gt; MA60</strong><small>MA20이 5거래일 전보다 상승</small></div>
             <div><span>매수</span><strong>최근 20주·20일 하위 40% · 4시간 BB 하위 25%</strong><small>주봉 저점 3% 하회·전고점 5% 이내 제외 · BB(6,2) 하단 3% 이내 · 주봉·일봉 추세 확인</small></div>
-            <div><span>매도</span><strong id="strategyExitValue">상단 + 예상 순수익 3% 이상 익절</strong><small id="strategyExitHelp">추적 기준에서 순수익 3% 확보 가능 시 활성화 · 이후 고점 -2% 보호 매도 · 평균 매입가 -3% 손절</small></div>
+            <div><span>매도</span><strong id="strategyExitValue">매도 기준 확인 중</strong><small id="strategyExitHelp">매도 조건 확인 중</small><small id="strategyAveragingHelp">추가 매수 설정 확인 중</small></div>
             <div><span>&#47588;&#49688;&#32;&#49884;&#44036;</span><strong>&#54217;&#51068;&#32;&#48;&#57;&#58;&#48;&#48;&#126;&#49;&#48;&#58;&#48;&#48;&#44;&#32;&#49;&#50;&#58;&#48;&#48;&#126;&#49;&#52;&#58;&#48;&#48;&#44;&#32;&#49;&#54;&#58;&#48;&#48;&#126;&#50;&#48;&#58;&#48;&#48;</strong><small>&#50528;&#54532;&#53552;&#47560;&#53011;&#32;&#51088;&#46041;&#32;&#47588;&#49688;&#32;&#48143;&#32;&#52572;&#49888;&#32;&#44144;&#47000;&#32;&#48516;&#48393;&#32;&#54869;&#51064;</small></div>
             <div><span>자금관리</span><strong>최대 5종목</strong><small id="strategyCapitalHelp">투자비율 확인 중</small></div>
             <div><span>신호 데이터</span><strong id="signalObservationCount">0건</strong><small>자동·수동 검색 결과를 DB에 누적</small></div>

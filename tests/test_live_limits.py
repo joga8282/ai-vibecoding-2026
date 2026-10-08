@@ -58,6 +58,13 @@ class LiveLimitConfigTest(TestCase):
         with self.assertRaisesRegex(RuntimeError, 'allowlist'):
             self.settings(LIVE_SYMBOL_POLICY='allowlist')
 
+    def test_ten_percent_profit_target_loads_without_changing_other_limits(self):
+        settings = self.settings(SWING_MIN_NET_PROFIT_PERCENT='10')
+        self.assertEqual(settings.swing_min_net_profit_percent, D(10))
+        self.assertEqual(settings.live_auto_max_total_exposure_ratio, D('.15'))
+        self.assertEqual(settings.manual_trade_ratio, D('.15'))
+        self.assertEqual(settings.live_sell_tax_rate, D('.002'))
+
 
 class FullEquityRiskTest(TestCase):
     def setUp(self):

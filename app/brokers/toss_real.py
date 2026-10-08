@@ -185,13 +185,15 @@ class TossRealBroker:
             if (not budget.is_finite() or budget <= 0
                     or quantity * valuation_price * (1 + self.settings.fee_rate) > budget):
                 raise RuntimeError('Order exceeds the selected investment budget.')
+        addition_plan = await self._verified_averaging_plan(request, symbol, side, quantity, valuation_price)
         if limit_price is not None:
             # A passive limit reduces immediate execution risk, but market movement can still fill it.
             buy_crosses = (limit_price >= quote.ask_price if quote.ask_price is not None
                            else limit_price >= quote.price)
             sell_crosses = (limit_price <= quote.bid_price if quote.bid_price is not None
                             else limit_price <= quote.price)
-            if (side is Side.BUY and buy_crosses) or (side is Side.SELL and sell_crosses):
+            if ((side is Side.BUY and buy_crosses and addition_plan is None)
+                    or (side is Side.SELL and sell_crosses)):
                 raise ValueError('Limit price would be marketable against the current quote.')
         opposite = any(str(o.get('symbol', '')).upper() == symbol for o in self.open_orders)
         if side is Side.BUY and opposite:
@@ -200,6 +202,15 @@ class TossRealBroker:
         pending_buy_exposure = self._pending_buy_exposure()
         if side is Side.BUY and pending_buy_exposure is None:
             raise RuntimeError('LIVE pending-buy exposure cannot be valued safely.')
+        position_count = len(self.positions)
+        if side is Side.BUY and self.settings.live_auto_allocation_mode == 'per_order':
+            if symbol in self.positions and addition_plan is None:
+                raise RuntimeError('이미 보유 중인 종목에는 추가 매수하지 않습니다.')
+            reserved = set(self.positions) | {
+                str(order.get('symbol', '')).upper() for order in self.open_orders
+                if str(order.get('side', '')).upper() == 'BUY'}
+            position_count = len(reserved)
+            pending_buy_exposure *= 1 + self.settings.fee_rate
         exposure = position_exposure + (pending_buy_exposure or Decimal(0))
         current_equity = None
         if side is Side.BUY:
@@ -214,9 +225,10 @@ class TossRealBroker:
                 raise RuntimeError('Order exceeds sellable quantity.')
         decision = self.risk.validate(
             symbol=symbol, side=side, quantity=quantity, price=valuation_price,
-            total_exposure=exposure, position_count=len(self.positions),
+            total_exposure=exposure, position_count=position_count,
             quote_at=quote.timestamp, current_equity=current_equity,
             has_opposite_open_order=opposite,
+            verified_position_addition=addition_plan is not None,
         )
         await self.repository.append_risk_event(symbol, decision.rule, decision.allowed, decision.detail)
         if not decision.allowed:
@@ -236,6 +248,12 @@ class TossRealBroker:
             'status': 'SUBMITTING', 'orderId': None,
             'createdAt': datetime.now(timezone.utc).isoformat(),
         }
+        if addition_plan is not None:
+            from app.swing_averaging import SNAPSHOT
+            saved = await self.repository.load(SNAPSHOT)
+            saved['plans'][addition_plan['id']]['status'] = 'SUBMITTING'
+            self.order_journal[exchange_id]['averagingPlanId'] = addition_plan['id']
+            await self.repository.save(SNAPSHOT, saved)
         await self._persist_live_state()
         try:
             payload = {
@@ -529,6 +547,57 @@ class TossRealBroker:
         await self._persist_live_state()
         return {'resolved': True, 'status': 'NOT_SUBMITTED', 'armed': False}
 
+    async def _verified_averaging_plan(self, request, symbol, side, quantity, price):
+        plan_id = request.get('averagingPlanId')
+        if not plan_id:
+            return None
+        from app.swing_averaging import SNAPSHOT
+        if (side is not Side.BUY or request.get('orderType') != 'LIMIT'
+                or not self.settings.swing_averaging_enabled
+                or self.settings.live_auto_allocation_mode != 'per_order'):
+            raise RuntimeError('Invalid averaging order policy.')
+        saved = await self.repository.load(SNAPSHOT) or {}
+        plan = saved.get('plans', {}).get(plan_id)
+        position = self.positions.get(symbol)
+        try:
+            expected_qty = Decimal(plan['holding_quantity'])
+            expected_average = Decimal(plan['holding_average'])
+            planned_qty = Decimal(plan['quantity'])
+            budget = Decimal(plan['budget'])
+            original_amount = Decimal(plan['original_amount'])
+            attempted = datetime.fromisoformat(plan['attempted_at'])
+            age = (datetime.now(timezone.utc) - attempted).total_seconds()
+            valid = (all(value.is_finite() and value > 0 for value in
+                         (expected_qty, expected_average, planned_qty, budget, original_amount))
+                     and plan['id'] == plan_id and plan['symbol'] == symbol
+                     and plan['status'] == 'RESERVED' and plan['owner_day_ids']
+                     and plan['client_order_id'] == request['clientOrderId']
+                     and position and position.quantity == expected_qty and position.average_price == expected_average
+                     and quantity == planned_qty and Decimal(str(request['orderBudget'])) == budget
+                     and budget <= original_amount and -2 <= age <= 30
+                     and price == request['quote'].ask_price
+                     and price <= expected_average * (1 - self.settings.swing_averaging_trigger_percent / 100)
+                     and quantity * price * (1 + self.settings.fee_rate) <= budget)
+        except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise RuntimeError('A fresh, unused persisted averaging reservation is required.')
+        if any(other['id'] != plan_id and other.get('symbol') == symbol and other.get('attempted_at')
+               and not other.get('closed_at')
+               for other in saved.get('plans', {}).values()):
+            raise RuntimeError('An averaging attempt already exists for this holding.')
+        return plan
+
+    async def place_averaging_order(self, **kwargs):
+        """A bounded, marketable limit for a previously reserved held-position addition."""
+        quote = kwargs['quote']
+        return await self.place_order({
+            'clientOrderId': kwargs['client_order_id'], 'symbol': quote.symbol,
+            'side': Side.BUY.value, 'orderType': 'LIMIT', 'price': str(quote.ask_price),
+            'quantity': str(kwargs['quantity']), 'quote': quote,
+            'orderBudget': kwargs['order_budget'], 'averagingPlanId': kwargs['averaging_plan_id'],
+        })
+
     async def place_market_order(self, **kwargs):
         if not self.risk or not self.settings or not self.settings.live_trading_enabled or not self.risk.armed:
             raise RuntimeError('LIVE trading is not armed.')
@@ -538,6 +607,7 @@ class TossRealBroker:
             'side': kwargs['side'].value, 'orderType': 'MARKET',
             'quantity': str(kwargs['quantity']), 'quote': quote,
             'orderBudget': kwargs.get('order_budget'),
+            'averagingPlanId': kwargs.get('averaging_plan_id'),
         })
 
     async def place_limit_order(self, *, client_order_id: str, quote, side: Side,

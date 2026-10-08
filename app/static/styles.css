@@ -217,6 +217,51 @@ h2 {
   color: var(--red);
 }
 
+.asset-breakdown {
+  display: grid;
+  gap: 16px;
+  margin: 20px 0 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.asset-breakdown-item dt {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.asset-breakdown-item dd {
+  margin: 0;
+}
+
+.asset-breakdown-value {
+  font-size: clamp(20px, 1.65vw, 25px);
+  font-weight: 760;
+  letter-spacing: -.04em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.asset-invested .asset-breakdown-value {
+  color: var(--blue-2);
+}
+
+.asset-uninvested .asset-breakdown-value {
+  color: var(--green);
+}
+
+.asset-breakdown-item .asset-breakdown-help {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.asset-breakdown-help span {
+  display: inline-block;
+}
+
 .risk-card {
   justify-content: space-between;
 }
